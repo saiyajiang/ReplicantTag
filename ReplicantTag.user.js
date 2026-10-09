@@ -2,8 +2,8 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.4.0
-// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
+// @version      1.4.1
+// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区行右侧、视频卡片UP名右侧、播放页昵称右侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
 // @license      MIT
@@ -76,6 +76,8 @@
   const AVATAR_SEL = ['.bili-avatar', '[class*="avatar"]', 'img'];
   const TITLE_SEL = ['h1.video-title', '.video-title', '.tit', '.title'];
   const CARD_TITLE_SEL = ['.bili-video-card__info--tit', '[class*="info--tit"]', '.bili-video-card__info--title', '.title', '.tit'];
+  // 卡片下方「UP 名」所在的那一行
+  const CARD_OWNER_SEL = ['.bili-video-card__info--owner', '[class*="info--owner"]', '.bili-video-card__info--author', '[class*="author"]', '.up-name'];
   const PUBDATE_SEL = ['[class*="pubdate"]', '[class*="pub-date"]', '.video-data .date', '.bili-video-info__date'];
   // 用户空间页（space.bilibili.com）的昵称元素
   const SPACE_NICK_SEL = ['#h-name', '.nickname', '.h-name', '.name', '[class*="nickname"]', 'h1'];
@@ -511,6 +513,12 @@
     return deepFindFirst(root, CARD_TITLE_SEL);
   }
 
+  function findCardOwner(host) {
+    const root = host && (host.shadowRoot || host);
+    if (!root) return null;
+    return deepFindFirst(root, CARD_OWNER_SEL);
+  }
+
   /* ---------------- 用户空间页（space.bilibili.com） ---------------- */
 
   function isSpacePage() {
@@ -760,15 +768,27 @@
       };
     }
 
-    // card：标题下方
+    // card：UP 名这一行的右侧（此前放在标题下方，会盖住 UP 名）
     const t = rec.title || findCardTitle(rec.host);
     rec.title = t;
-    if (t) {
-      let r = null;
-      try { r = t.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
-      if (r && (r.width || r.height)) return { main: r, mode: 'below' };
-    }
-    return { main: aRect, mode: 'below' };
+    let ownerRect = null;
+    try {
+      const ow = findCardOwner(rec.host);
+      if (ow) ownerRect = ow.getBoundingClientRect();
+    } catch (e) { /* 忽略 */ }
+    if (!ownerRect || (!ownerRect.width && !ownerRect.height)) ownerRect = aRect;
+    let cardRect = null;
+    try { cardRect = rec.host && rec.host.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+    const okCard = cardRect && cardRect.width ? cardRect : null;
+    return {
+      main: aRect,
+      name: aRect,
+      text: ownerRect,
+      container: okCard,
+      limit: okCard ? okCard.right - 4 : (window.innerWidth - 6),
+      avoids: avoidRects(rec.host, a),
+      mode: 'cardRight',
+    };
   }
 
   // 纯函数：给定矩形与尺寸，算出浮标左上角坐标
@@ -818,7 +838,7 @@
           }
         }
       }
-    } else if (mode === 'nameRight') {
+    } else if (mode === 'nameRight' || mode === 'cardRight') {
       // 空间页：紧贴昵称右侧，与昵称同高；压到按钮就退到按钮之后；都放不下才退到昵称下方
       const limit = Math.min(rects.limit || main.right, vw) - 6;
       const by = name.top + (name.height - bh) / 2;
