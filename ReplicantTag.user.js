@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.2.0
+// @version      1.3.0
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -264,14 +264,66 @@
   // 早期版本会把这些 CSS 当成评论正文抓进来。
   const SKIP_TAGS = { STYLE: 1, SCRIPT: 1, NOSCRIPT: 1, TEMPLATE: 1, LINK: 1, META: 1, HEAD: 1, TITLE: 1, SVG: 1, PATH: 1 };
 
-  function cleanText(s) {
+  // 判断一段文本是否其实是 CSS（B站组件的 shadow DOM 里内联了 :host{--bili-xxx:...}）
+  function looksLikeCSS(s) {
+    const t = String(s || '');
+    if (!t) return false;
+    if (/--bili-[a-z0-9-]+\s*:/i.test(t)) return true;
+    if (/--[a-z][a-z0-9-]{2,}\s*:/.test(t) && /[;{}]/.test(t)) return true;
+    if (/@media|@keyframes|!important/.test(t)) return true;
+    // 花括号成对 + 含分号/冒号，基本可判定为样式表
+    if (/\{[\s\S]*\}/.test(t) && /[;:]/.test(t)) return true;
+    return false;
+  }
+
+  // 把 CSS 从文本中剔除；清不干净就返回空串（宁可显示「未识别」也不要显示样式代码）
+  function sanitizeContent(s) {
     let t = String(s || '').replace(/\s+/g, ' ').trim();
     if (!t) return '';
-    // 兜底：万一仍有 B站内部 CSS 变量混进来，剔除之
-    if (/--bili-[a-z0-9-]+\s*:/i.test(t)) {
-      t = t.replace(/--bili-[a-z0-9-]+\s*:[^;}]*[;}]?/gi, ' ').replace(/\s+/g, ' ').trim();
-    }
-    return t;
+    if (!looksLikeCSS(t)) return t;
+    t = t.replace(/\/\*[\s\S]*?\*\//g, ' ');
+    t = t.replace(/[^{}]*\{[^{}]*\}/g, ' ');              // 整条规则块
+    t = t.replace(/--[a-zA-Z0-9-]+\s*:[^;}]*[;}]?/g, ' '); // 残留的自定义属性
+    t = t.replace(/@[a-z-]+\b[^;{]*[;{]?/gi, ' ');         // @media 等 at-rule
+    t = t.replace(/[a-z-]+\s*:\s*[^;{}]*;?/gi, (m) => (/[\u4e00-\u9fa5]/.test(m) ? m : ' '));
+    t = t.replace(/\s+/g, ' ').trim();
+    if (looksLikeCSS(t)) return '';
+    // CSS 与正文混排时，去掉开头残留的样式碎片
+    t = t.replace(/^[\s:;{}.,#()\[\]'"a-z-]+\s*(?=[\u4e00-\u9fa5])/i, '');
+    return t.trim();
+  }
+
+  function cleanText(s) {
+    return sanitizeContent(s);
+  }
+
+  // 只读 light DOM 文本（克隆后删掉 style/script，避免把内联样式算进来）
+  function lightText(el) {
+    if (!el) return '';
+    try {
+      const clone = el.cloneNode(true);
+      const bad = clone.querySelectorAll ? clone.querySelectorAll('style,script,template,noscript') : [];
+      for (const n of bad) n.remove();
+      return sanitizeContent(clone.textContent || '');
+    } catch (e) { return ''; }
+  }
+
+  // 只读 shadow DOM 里的文本，跳过 style/script
+  function shadowText(el) {
+    if (!el || !el.shadowRoot) return '';
+    let out = '';
+    const walk = (n, lv) => {
+      if (lv > 8) return;
+      for (const c of n.childNodes) {
+        if (c.nodeType === 3) { out += c.nodeValue; continue; }
+        if (c.nodeType !== 1) continue;
+        if (SKIP_TAGS[c.tagName]) continue;
+        if (c.shadowRoot) walk(c.shadowRoot, lv + 1);
+        walk(c, lv + 1);
+      }
+    };
+    walk(el.shadowRoot, 0);
+    return sanitizeContent(out);
   }
 
   function textOf(el) {
@@ -509,19 +561,26 @@
     return found[0];
   }
 
-  // bili-rich-text 的正文在其 light DOM（<span>/<p>），shadow DOM 里只有 <style>，
-  // 因此优先读 light DOM，读不到再退到 shadow。
-  function bodyText(el) {
-    if (!el) return '';
-    let s = '';
-    try {
-      const clone = el.cloneNode(true);
-      const styles = clone.querySelectorAll ? clone.querySelectorAll('style,script,template') : [];
-      for (const st of styles) st.remove();
-      s = (clone.textContent || '').replace(/\s+/g, ' ').trim();
-    } catch (e) { s = ''; }
-    if (!s) s = textOf(el);
-    return cleanText(s);
+  // 评论正文提取。B站 bili-rich-text 的结构不固定：
+  // 有时正文在 light DOM（<span>），有时整个渲染在 shadow DOM 里且混着 <style>。
+  // 这里按「light → shadow(跳过样式) → 整节点」顺序尝试，每一步都做 CSS 清洗，
+  // 拿到疑似 CSS 的结果就继续退到下一级，宁可显示「未识别」也不显示样式代码。
+  const COMMENT_BODY_SEL = ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '.reply-content-container', '.content'];
+
+  function commentContent(host) {
+    const root = host && (host.shadowRoot || host);
+    const body = deepFindFirst(root, COMMENT_BODY_SEL);
+    const tries = [];
+    if (body) {
+      tries.push(lightText(body));
+      tries.push(shadowText(body));
+      tries.push(sanitizeContent(textOf(body)));
+    }
+    tries.push(sanitizeContent(textOf(host)));
+    for (const t of tries) {
+      if (t && !looksLikeCSS(t)) return t.slice(0, 500);
+    }
+    return '';
   }
 
   function buildCtx(rec) {
@@ -537,14 +596,9 @@
       };
     }
     if (rec.scene === 'comment') {
-      const root = host && (host.shadowRoot || host);
-      const body = deepFindFirst(root, ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '.reply-content-container', '.content']);
-      let content = bodyText(body);
-      if (!content && body) content = textOf(body);
-      if (!content) content = textOf(host);
       return {
         type: 'comment',
-        content: content.slice(0, 500),
+        content: commentContent(host),
         bv: currentBV(),
         title: currentTitle(),
         videoTime: currentPubDate(),
@@ -644,10 +698,17 @@
       rec.avatar = av;
       let avRect = null;
       try { avRect = av && av.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
-      // 红框位置：UP 面板左侧内部；若空间不足会盖住头像，则退到头像左外侧
+      // text：UP 昵称 / 简介所在的文字块，标记必须避开它
+      let textRect = null;
+      try {
+        const infoEl = deepFindFirst(host && (host.shadowRoot || host), ['.up-info--container', '.up-detail-container', '[class*="up-info"]', '.up-detail', '.info']);
+        if (infoEl) textRect = infoEl.getBoundingClientRect();
+      } catch (e) { /* 忽略 */ }
+      if (!textRect || (!textRect.width && !textRect.height)) textRect = aRect;
       return {
         main: hostRect && (hostRect.width || hostRect.height) ? hostRect : aRect,
         guard: avRect && (avRect.width || avRect.height) ? avRect : aRect,
+        text: textRect,
         mode: 'up',
       };
     }
@@ -670,12 +731,25 @@
     const off = offsetSetting();
     let left, top, maxW = 0;
     if (mode === 'up') {
-      // 始终放在 UP 面板最左内侧（红框位置）；宽度超出可用空间时靠 maxW 收敛，不整体外移
-      const hostL = main.left;
-      const avL = guard.left;
-      left = hostL + 2;
-      maxW = Math.max(28, Math.min(150, avL - hostL - 8));
       top = main.top + (main.height - bh) / 2;
+      const text = rects.text || guard;
+      // 候选 A：UP 面板最左内侧的空白处（红框位置）—— 只有放得下完整内容才用，
+      // 否则会截断；放不下就换候选，绝不压缩成"半个标记"。
+      const availLeft = guard.left - main.left - 8;
+      if (availLeft >= bw + 4) {
+        left = main.left + 2;
+      } else {
+        // 候选 B：头像与文字块右侧的空白区
+        const cand = Math.max(guard.right, text.right) + 8;
+        const limit = Math.min(main.right, vw) - 6;
+        if (cand + bw <= limit) {
+          left = cand;
+        } else {
+          // 候选 C：UP 面板下方（不遮挡头像、昵称与简介）
+          left = main.left;
+          top = main.bottom + 4;
+        }
+      }
     } else if (mode === 'right') {
       top = main.top + (main.height - bh) / 2;
       const cont = rects.container;
@@ -862,6 +936,8 @@
   /* ====================== 标记面板 ====================== */
 
   let panel = null;
+  let lastPanelPos = null;
+  let lastMgrPos = null;
 
   function closePanel() {
     if (panel) { panel.remove(); panel = null; }
@@ -926,7 +1002,7 @@
         } else {
           lines.push(h('div', { class: 'rt-item-line rt-item-line--t' }, [
             h('span', { class: 'rt-badge rt-badge--cmt', text: it.type === 'comment' ? '评论' : it.type === 'space' ? '空间' : '手动' }),
-            h('span', { text: (it.content || '(无内容)').slice(0, 90) }),
+            h('span', { text: (sanitizeContent(it.content) || '(无内容)').slice(0, 90) }),
           ]));
           lines.push(h('div', { class: 'rt-item-meta' }, [
             it.bv ? h('a', { class: 'rt-link', href: 'https://www.bilibili.com/video/' + it.bv, target: '_blank', rel: 'noreferrer', text: it.bv }) : null,
@@ -1005,11 +1081,14 @@
       drop.style.display = 'block';
     }
 
+    const panelHd = h('div', { class: 'rt-panel-hd' }, [
+      h('span', { class: 'rt-panel-title', text: '标记用户' }),
+      h('span', { class: 'rt-dim rt-panel-tip', text: '拖动此处移动' }),
+      h('span', { class: 'rt-x', title: '关闭', onclick: closePanel, text: '×' }),
+    ]);
+
     panel = h('div', { class: 'rt-panel' }, [
-      h('div', { class: 'rt-panel-hd' }, [
-        h('span', { text: '标记用户' }),
-        h('span', { class: 'rt-x', title: '关闭', onclick: closePanel, text: '×' }),
-      ]),
+      panelHd,
       h('div', { class: 'rt-panel-bd' }, [
         h('div', { class: 'rt-user' }, [
           h('div', { class: 'rt-nick', text: nick || '(未知昵称)' }),
@@ -1035,7 +1114,7 @@
             onclick: () => {
               const cur = store.users[uid] || { tags: [], items: [] };
               const txt = ['昵称：' + (cur.nickname || nick), 'UID：' + uid, '标记：' + (cur.tags || []).join('、')]
-                .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : it.type === 'comment' ? '[评论] ' : '[空间] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || it.content || '') + (it.bv ? ' | ' + it.bv : '')))
+                .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : it.type === 'comment' ? '[评论] ' : '[空间] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || sanitizeContent(it.content) || '') + (it.bv ? ' | ' + it.bv : '')))
                 .join('\n');
               copyText(txt);
             },
@@ -1047,15 +1126,78 @@
 
     document.documentElement.appendChild(panel);
     placePanel(panel, rec);
+    makeDraggable(panel, panelHd);
     refreshTags();
     renderItems();
     setTimeout(() => { try { input.focus(); } catch (e) { /* 忽略 */ } }, 30);
+  }
+
+  // 面板拖拽：按住标题栏拖动，松手结束；始终限制在视口内
+  function makeDraggable(el, handle) {
+    if (!el || !handle) return;
+    let dragging = false, sx = 0, sy = 0, ox = 0, oy = 0, moved = false;
+
+    const onDown = (ev) => {
+      if (ev.target && ev.target.classList && ev.target.classList.contains('rt-x')) return;
+      if (ev.button != null && ev.button !== 0) return;
+      const r = el.getBoundingClientRect();
+      dragging = true; moved = false;
+      sx = ev.clientX; sy = ev.clientY;
+      ox = ev.clientX - r.left; oy = ev.clientY - r.top;
+      el.classList.add('rt-dragging');
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    const onMove = (ev) => {
+      if (!dragging) return;
+      const dx = ev.clientX - sx, dy = ev.clientY - sy;
+      if (!moved && Math.abs(dx) + Math.abs(dy) > 2) moved = true;
+      setPanelPos(el, ev.clientX - ox, ev.clientY - oy);
+      ev.preventDefault();
+    };
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      el.classList.remove('rt-dragging');
+      document.removeEventListener('mousemove', onMove, true);
+      document.removeEventListener('mouseup', onUp, true);
+      if (moved) {
+        const r = el.getBoundingClientRect();
+        const pos = { left: Math.round(r.left), top: Math.round(r.top) };
+        el.__rtDragged = pos;
+        if (el.classList.contains('rt-panel--mgr')) lastMgrPos = pos;
+        else lastPanelPos = pos;
+      }
+    };
+    // 结束后的一次点击不应触发面板里的按钮
+    handle.addEventListener('click', (ev) => { if (moved) { ev.stopPropagation(); moved = false; } }, true);
+
+    handle.addEventListener('mousedown', onDown);
+    el.__rtDrag = true;
+  }
+
+  function setPanelPos(el, left, top) {
+    const w = el.offsetWidth || 360;
+    const h = el.offsetHeight || 400;
+    const maxL = Math.max(4, window.innerWidth - w - 4);
+    const maxT = Math.max(4, window.innerHeight - Math.min(h, window.innerHeight) - 4);
+    el.style.left = Math.max(4, Math.min(left, maxL)) + 'px';
+    el.style.top = Math.max(4, Math.min(top, maxT)) + 'px';
   }
 
   function placePanel(p, rec) {
     p.style.visibility = 'hidden';
     const w = p.offsetWidth || 360;
     const hh = p.offsetHeight || 400;
+    // 本次会话里拖过面板就沿用上次的位置，避免重新打开又跳回原处
+    const last = p.__rtDragged || (p.classList.contains('rt-panel--mgr') ? lastMgrPos : lastPanelPos);
+    if (last) {
+      setPanelPos(p, last.left, last.top);
+      p.style.visibility = '';
+      return;
+    }
     let left = 12, top = 12;
     try {
       const r = rec.a.getBoundingClientRect();
@@ -1063,8 +1205,7 @@
       top = r.bottom + 6;
       if (top + hh > window.innerHeight - 8) top = Math.max(8, window.innerHeight - hh - 12);
     } catch (e) { /* 忽略 */ }
-    p.style.left = left + 'px';
-    p.style.top = top + 'px';
+    setPanelPos(p, left, top);
     p.style.visibility = '';
   }
 
@@ -1159,11 +1300,14 @@
       fileInput.value = '';
     });
 
+    const mgrHd = h('div', { class: 'rt-panel-hd' }, [
+      h('span', { class: 'rt-panel-title', text: '标记管理' }),
+      h('span', { class: 'rt-dim rt-panel-tip', text: '拖动此处移动' }),
+      h('span', { class: 'rt-x', title: '关闭', onclick: () => { mgr.remove(); mgr = null; }, text: '×' }),
+    ]);
+
     mgr = h('div', { class: 'rt-panel rt-panel--mgr' }, [
-      h('div', { class: 'rt-panel-hd' }, [
-        h('span', { text: '标记管理' }),
-        h('span', { class: 'rt-x', title: '关闭', onclick: () => { mgr.remove(); mgr = null; }, text: '×' }),
-      ]),
+      mgrHd,
       h('div', { class: 'rt-panel-bd' }, [
         h('div', { class: 'rt-input-row' }, [search]),
         h('div', { class: 'rt-actions' }, [
@@ -1174,6 +1318,7 @@
           h('button', { class: 'rt-btn', id: 'rt-btn-dim', text: store.settings.dim ? '标记显示：半透明' : '标记显示：常显', onclick: (ev) => { toggleDim(); ev.target.textContent = store.settings.dim ? '标记显示：半透明' : '标记显示：常显'; } }),
           h('button', { class: 'rt-btn', text: '位置微调', onclick: askOffset }),
           h('button', { class: 'rt-btn', text: '重置偏移', onclick: resetOffset }),
+          h('button', { class: 'rt-btn', text: '清理样式残留', onclick: purgeCSS }),
           h('button', {
             class: 'rt-btn rt-btn--danger',
             text: '清空全部',
@@ -1199,6 +1344,7 @@
     mgr.style.left = Math.max(8, (window.innerWidth - w) / 2) + 'px';
     mgr.style.top = Math.max(8, (window.innerHeight - hh) / 2) + 'px';
     mgr.style.maxHeight = hh + 'px';
+    makeDraggable(mgr, mgrHd);
     renderList();
   }
 
@@ -1225,6 +1371,23 @@
     } catch (e) {
       toast('导入失败：文件不是合法 JSON');
     }
+  }
+
+  // 清理历史留痕里的 CSS 垃圾（旧版本曾把 B站组件的样式表当成评论正文存下来）
+  function purgeCSS() {
+    let n = 0;
+    Object.keys(store.users).forEach((uid) => {
+      const u = store.users[uid];
+      if (!u || !u.items) return;
+      u.items.forEach((it) => {
+        if (!it.content) return;
+        const cleaned = sanitizeContent(it.content);
+        if (cleaned !== it.content) { it.content = cleaned; n++; }
+      });
+    });
+    if (!n) { toast('没有需要清理的记录'); return; }
+    saveStore();
+    toast('已清理 ' + n + ' 条历史记录中的样式代码');
   }
 
   function unionArr(a, b) {
@@ -1315,7 +1478,10 @@
       '.rt-mini--add{background:#fff;color:#fb7299!important;border:1px solid #fb7299;box-shadow:0 1px 5px rgba(0,0,0,.45)}',
       '.rt-panel{position:fixed;z-index:2147483100;width:360px;max-height:72vh;overflow:auto;background:#fff;color:#222;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.28);font-size:13px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.5}',
       '.rt-panel--mgr{width:520px}',
-      '.rt-panel-hd{position:sticky;top:0;display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#fb7299;color:#fff;font-weight:600;border-radius:10px 10px 0 0}',
+      '.rt-panel-hd{position:sticky;top:0;display:flex;align-items:center;gap:8px;padding:10px 12px;background:#fb7299;color:#fff;font-weight:600;border-radius:10px 10px 0 0;cursor:move;user-select:none;-webkit-user-select:none}',
+      '.rt-panel-title{flex:none}',
+      '.rt-panel-tip{flex:1;color:#ffe3ec!important;font-size:11px;font-weight:400;opacity:.9}',
+      '.rt-panel.rt-dragging{box-shadow:0 14px 40px rgba(0,0,0,.4)}',
       '.rt-x{cursor:pointer;font-size:18px;line-height:1;padding:0 4px}',
       '.rt-panel-bd{padding:10px 12px 14px}',
       '.rt-user{margin-bottom:8px}',
@@ -1423,6 +1589,7 @@
       GM_registerMenuCommand('切换隐身模式（Alt+Shift+M）', toggleStealth);
       GM_registerMenuCommand('开启/关闭页面渲染（排查用）', toggleEnabled);
       GM_registerMenuCommand('标记显示：常显 / 半透明', toggleDim);
+      GM_registerMenuCommand('清理历史留痕中的样式代码', purgeCSS);
       GM_registerMenuCommand('位置微调（整体偏移）', askOffset);
       GM_registerMenuCommand('重置位置偏移', resetOffset);
       GM_registerMenuCommand('立即重新定位标记', () => { scan(); toast('已重新定位'); });
@@ -1458,5 +1625,9 @@
     dedupeAnchors: dedupeAnchors,
     isSpacePage: isSpacePage,
     spaceUid: spaceUid,
+    sanitizeContent: sanitizeContent,
+    looksLikeCSS: looksLikeCSS,
+    commentContent: commentContent,
+    purgeCSS: purgeCSS,
   };
 })();
