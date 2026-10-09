@@ -2,8 +2,8 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.1.1
-// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
+// @version      1.2.0
+// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
 // @license      MIT
@@ -76,6 +76,8 @@
   const TITLE_SEL = ['h1.video-title', '.video-title', '.tit', '.title'];
   const CARD_TITLE_SEL = ['.bili-video-card__info--tit', '[class*="info--tit"]', '.bili-video-card__info--title', '.title', '.tit'];
   const PUBDATE_SEL = ['[class*="pubdate"]', '[class*="pub-date"]', '.video-data .date', '.bili-video-info__date'];
+  // 用户空间页（space.bilibili.com）的昵称元素
+  const SPACE_NICK_SEL = ['#h-name', '.nickname', '.h-name', '.name', '[class*="nickname"]', 'h1'];
 
   /* ====================== 存储 ====================== */
 
@@ -83,7 +85,7 @@
   let storeRev = store.rev || 0;
 
   function blankStore() {
-    return { users: {}, tagLib: [], settings: { stealth: false, enabled: true }, rev: 0 };
+    return { users: {}, tagLib: [], settings: { stealth: false, enabled: true, dim: false, offset: { x: 0, y: 0 } }, rev: 0 };
   }
 
   function readStore() {
@@ -96,7 +98,7 @@
       return {
         users: (o && o.users) || {},
         tagLib: (o && o.tagLib) || [],
-        settings: Object.assign({ stealth: false, enabled: true }, (o && o.settings) || {}),
+        settings: Object.assign({ stealth: false, enabled: true, dim: false, offset: { x: 0, y: 0 } }, (o && o.settings) || {}),
         rev: (o && o.rev) || 0,
       };
     } catch (e) {
@@ -385,11 +387,21 @@
     } catch (e) { return null; }
   }
 
+  // 头像链接没有昵称文字，不能作为锚点。除了自身 class，还要看近几层祖先：
+  // B站把 <a><img></a> 包在 .bili-avatar / .avatar / .face 容器里。
   function isAvatarLink(a) {
     if (!a) return false;
     const cls = String(a.className || '');
-    if (/avatar|face|bili-avatar/i.test(cls)) return true;
-    try { if (a.querySelector('img, svg')) return true; } catch (e) { /* 忽略 */ }
+    if (/avatar|face|bili-avatar|user-face/i.test(cls)) return true;
+    try { if (a.querySelector('img, svg, picture')) return true; } catch (e) { /* 忽略 */ }
+    const chain = ancestors(a);
+    for (let i = 0; i < Math.min(chain.length, 4); i++) {
+      const el = chain[i];
+      if (!el || el === a) continue;
+      const c = String((el.className && el.className.baseVal !== undefined ? el.className.baseVal : el.className) || '');
+      const tag = String(el.tagName || '');
+      if (/avatar|face|bili-avatar|user-face/i.test(c) || /avatar|face/i.test(tag)) return true;
+    }
     return false;
   }
 
@@ -397,11 +409,11 @@
     if (!a || !b) return false;
     const ox = Math.min(a.right, b.right) - Math.max(a.left, b.left);
     const oy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-    // 直接重叠，或紧挨着（同一行内的头像与昵称）
-    if (ox > -60 && oy > -40) return true;
+    // 直接重叠，或同一行内紧挨着（头像与昵称之间常有十几到上百像素间距）
+    if (ox > -140 && oy > -60) return true;
     const cx1 = (a.left + a.right) / 2, cy1 = (a.top + a.bottom) / 2;
     const cx2 = (b.left + b.right) / 2, cy2 = (b.top + b.bottom) / 2;
-    return Math.abs(cx1 - cx2) < 90 && Math.abs(cy1 - cy2) < 70;
+    return Math.abs(cx1 - cx2) < 240 && Math.abs(cy1 - cy2) < 60;
   }
 
   // 同一位置多个候选时选最优锚点：有昵称 > 非头像链接 > 有矩形
@@ -428,8 +440,11 @@
     }
     const out = [];
     for (const g of groups) {
+      // 只要簇里存在非头像候选，就整体丢弃头像候选（头像链接没有昵称，点了也没用）
+      const named = g.items.filter((it) => !it.isAvatar);
+      const pool = named.length ? named : g.items;
       let best = null;
-      for (const it of g.items) {
+      for (const it of pool) {
         if (!best || anchorScore(it) > anchorScore(best)) best = it;
       }
       out.push(best);
@@ -441,6 +456,57 @@
     const root = host && (host.shadowRoot || host);
     if (!root) return null;
     return deepFindFirst(root, CARD_TITLE_SEL);
+  }
+
+  /* ---------------- 用户空间页（space.bilibili.com） ---------------- */
+
+  function isSpacePage() {
+    if (/^space\.bilibili\.com$/i.test(location.hostname)) return true;
+    if (/space\.bilibili\.com/i.test(location.hostname) && /space\.bilibili\.com\/\d+/i.test(location.href)) return true;
+    return false;
+  }
+
+  function spaceUid() {
+    const m = location.href.match(/space\.bilibili\.com\/(\d+)/);
+    if (m) return m[1];
+    const m2 = location.pathname.match(/^\/(\d{3,})/);
+    return m2 ? m2[1] : '';
+  }
+
+  // 空间页顶部「本人」区域里的链接（如头像/昵称自链），不应被同 UID 规则跳过
+  function isSpaceOwnerEl(el) {
+    const owner = findSpaceOwnerCached();
+    if (!owner || !owner.el) return false;
+    return el === owner.el || owner.el.contains(el) || el.contains(owner.el);
+  }
+
+  let ownerCache = { key: '', val: null };
+  function findSpaceOwnerCached() {
+    const key = location.href;
+    if (ownerCache.key === key && ownerCache.val) return ownerCache.val;
+    const v = findSpaceOwner();
+    ownerCache = { key: key, val: v };
+    return v;
+  }
+
+  // 空间页顶部昵称（页面主人本人）。取最靠上的、确实有文字的那个。
+  function findSpaceOwner() {
+    const found = [];
+    forEachRoot((root) => {
+      let els;
+      try { els = root.querySelectorAll(SPACE_NICK_SEL.join(',')); } catch (e) { return; }
+      for (const el of els) {
+        const t = textOf(el);
+        if (!t || t.length > 40) continue;
+        const r = rectOf(el);
+        if (!r) continue;
+        if (r.top < 0 || r.top > Math.max(600, window.innerHeight * 0.8)) continue;
+        found.push({ el: el, nick: t, rect: r });
+      }
+    });
+    if (!found.length) return null;
+    found.sort((a, b) => a.rect.top - b.rect.top || b.rect.width - a.rect.width);
+    return found[0];
   }
 
   // bili-rich-text 的正文在其 light DOM（<span>/<p>），shadow DOM 里只有 <style>，
@@ -460,6 +526,16 @@
 
   function buildCtx(rec) {
     const host = rec.host;
+    if (rec.scene === 'space') {
+      return {
+        type: 'space',
+        content: '',
+        bv: '',
+        title: rec.nick || currentTitle(),
+        videoTime: '',
+        url: location.href,
+      };
+    }
     if (rec.scene === 'comment') {
       const root = host && (host.shadowRoot || host);
       const body = deepFindFirst(root, ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '.reply-content-container', '.content']);
@@ -544,12 +620,20 @@
     if (rec.scene === 'comment') {
       const lv = rec.level || findLevel(a);
       rec.level = lv;
-      if (lv) {
-        let r = null;
-        try { r = lv.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
-        if (r && (r.width || r.height)) return { main: r, mode: 'right' };
-      }
-      return { main: aRect, mode: 'right' };
+      let r = null;
+      if (lv) { try { r = lv.getBoundingClientRect(); } catch (e) { /* 忽略 */ } }
+      if (!r || (!r.width && !r.height)) r = aRect;
+      // 容器：整条评论，用来把标记放到右侧空白区
+      let cont = null;
+      try { cont = rec.host && rec.host.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      return { main: r, container: (cont && cont.width ? cont : null), mode: 'right' };
+    }
+
+    if (rec.scene === 'space') {
+      // 用户空间页：放在昵称右侧的空白区
+      let cont = null;
+      try { cont = rec.host && rec.host.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      return { main: aRect, container: (cont && cont.width ? cont : null), mode: 'right' };
     }
 
     if (rec.scene === 'up') {
@@ -583,6 +667,7 @@
   function computePos(mode, rects, bw, bh, vw) {
     const main = rects.main;
     const guard = rects.guard || main;
+    const off = offsetSetting();
     let left, top, maxW = 0;
     if (mode === 'up') {
       // 始终放在 UP 面板最左内侧（红框位置）；宽度超出可用空间时靠 maxW 收敛，不整体外移
@@ -592,8 +677,16 @@
       maxW = Math.max(28, Math.min(150, avL - hostL - 8));
       top = main.top + (main.height - bh) / 2;
     } else if (mode === 'right') {
-      left = main.right + 5;
       top = main.top + (main.height - bh) / 2;
+      const cont = rects.container;
+      // 优先右移到整条评论 / 信息区右侧的空白位置，避免压在昵称、等级上
+      if (cont && cont.width >= bw + 220) {
+        const rightEdge = cont.right - bw - 12;
+        left = Math.min(rightEdge, main.right + 520);
+        if (left < main.right + 24) left = main.right + 5; // 容器太窄时退回原位
+      } else {
+        left = main.right + 5;
+      }
       if (left + bw > vw - 6) {
         const back = main.left - bw - 5;
         left = back >= 6 ? back : Math.max(6, vw - bw - 6);
@@ -605,7 +698,16 @@
     }
     left = Math.max(4, Math.min(left, Math.max(4, vw - bw - 4)));
     top = Math.max(4, top);
-    return { left: Math.round(left), top: Math.round(top), maxW: maxW ? Math.round(maxW) : 0 };
+    return {
+      left: Math.round(left + off.x),
+      top: Math.round(top + off.y),
+      maxW: maxW ? Math.round(maxW) : 0,
+    };
+  }
+
+  function offsetSetting() {
+    const s = (store.settings && store.settings.offset) || {};
+    return { x: Number(s.x) || 0, y: Number(s.y) || 0 };
   }
 
   function layout() {
@@ -683,6 +785,8 @@
     });
 
     // 1) 收集候选
+    const spacePage = isSpacePage();
+    const ownerUid = spacePage ? spaceUid() : '';
     const cands = [];
     forEachRoot((root) => {
       let as;
@@ -690,6 +794,8 @@
       for (const a of as) {
         const uid = uidFromHref(hrefOf(a));
         if (!uid) continue;
+        // 空间页里，主人的视频卡片、动态全都同 UID，只在昵称处标一次，避免满屏重复
+        if (ownerUid && uid === ownerUid && !isSpaceOwnerEl(a)) continue;
         const c = classify(a);
         if (!c) continue;
         const rect = rectOf(a);
@@ -699,6 +805,17 @@
         cands.push({ a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, rect: rect, isAvatar: isAvatarLink(a) });
       }
     });
+
+    // 1b) 空间页：给页面主人补一个锚点（昵称本身通常不是链接）
+    if (ownerUid) {
+      const owner = findSpaceOwner();
+      if (owner && !cands.some((c) => c.uid === ownerUid && c.a === owner.el)) {
+        cands.push({
+          a: owner.el, uid: ownerUid, nick: owner.nick, scene: 'space',
+          host: owner.el.parentElement || owner.el, rect: owner.rect, isAvatar: false,
+        });
+      }
+    }
 
     // 2) 昵称回填：头像链接没有文字，用同 UID 的昵称链接补齐
     const nickMap = new Map();
@@ -808,7 +925,7 @@
           lines.push(h('div', { class: 'rt-item-line rt-item-meta' }, interleave(meta)));
         } else {
           lines.push(h('div', { class: 'rt-item-line rt-item-line--t' }, [
-            h('span', { class: 'rt-badge rt-badge--cmt', text: it.type === 'comment' ? '评论' : '手动' }),
+            h('span', { class: 'rt-badge rt-badge--cmt', text: it.type === 'comment' ? '评论' : it.type === 'space' ? '空间' : '手动' }),
             h('span', { text: (it.content || '(无内容)').slice(0, 90) }),
           ]));
           lines.push(h('div', { class: 'rt-item-meta' }, [
@@ -829,7 +946,11 @@
     };
 
     const ctxBox = h('div', { class: 'rt-ctx' });
-    if (ctx.type === 'comment') {
+    if (ctx.type === 'space') {
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '类型：' }), h('span', { text: '用户空间' })]));
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '昵称：' }), h('span', { class: 'rt-v', text: (ctx.title || '(未识别)').slice(0, 60) })]));
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '页面：' }), h('a', { class: 'rt-link', href: location.href, target: '_blank', rel: 'noreferrer', text: 'space.bilibili.com/' + uid })]));
+    } else if (ctx.type === 'comment') {
       ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '类型：' }), h('span', { text: '评论' })]));
       ctxBox.appendChild(h('div', { class: 'rt-ctx-row rt-ctx-cmt' }, [h('span', { class: 'rt-k', text: '内容：' }), h('span', { class: 'rt-v', text: (ctx.content || '(未识别)').slice(0, 160) })]));
       if (ctx.bv) ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '所在视频：' }), h('a', { class: 'rt-link', href: 'https://www.bilibili.com/video/' + ctx.bv, target: '_blank', rel: 'noreferrer', text: ctx.bv })]));
@@ -914,7 +1035,7 @@
             onclick: () => {
               const cur = store.users[uid] || { tags: [], items: [] };
               const txt = ['昵称：' + (cur.nickname || nick), 'UID：' + uid, '标记：' + (cur.tags || []).join('、')]
-                .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : '[评论] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || it.content || '') + (it.bv ? ' | ' + it.bv : '')))
+                .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : it.type === 'comment' ? '[评论] ' : '[空间] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || it.content || '') + (it.bv ? ' | ' + it.bv : '')))
                 .join('\n');
               copyText(txt);
             },
@@ -1050,6 +1171,9 @@
           h('button', { class: 'rt-btn', text: '导入 JSON', onclick: () => fileInput.click() }),
           h('button', { class: 'rt-btn', id: 'rt-btn-stealth', text: store.settings.stealth ? '隐身模式：开' : '隐身模式：关', onclick: (ev) => { toggleStealth(); ev.target.textContent = store.settings.stealth ? '隐身模式：开' : '隐身模式：关'; } }),
           h('button', { class: 'rt-btn', id: 'rt-btn-enable', text: store.settings.enabled ? '页面渲染：开' : '页面渲染：关', onclick: (ev) => { toggleEnabled(); ev.target.textContent = store.settings.enabled ? '页面渲染：开' : '页面渲染：关'; } }),
+          h('button', { class: 'rt-btn', id: 'rt-btn-dim', text: store.settings.dim ? '标记显示：半透明' : '标记显示：常显', onclick: (ev) => { toggleDim(); ev.target.textContent = store.settings.dim ? '标记显示：半透明' : '标记显示：常显'; } }),
+          h('button', { class: 'rt-btn', text: '位置微调', onclick: askOffset }),
+          h('button', { class: 'rt-btn', text: '重置偏移', onclick: resetOffset }),
           h('button', {
             class: 'rt-btn rt-btn--danger',
             text: '清空全部',
@@ -1126,7 +1250,38 @@
   /* ====================== 隐身 / 暂停 ====================== */
 
   function applyStealth() {
-    if (overlay) overlay.style.display = (!store.settings.enabled || store.settings.stealth) ? 'none' : '';
+    if (overlay) {
+      overlay.style.display = (!store.settings.enabled || store.settings.stealth) ? 'none' : '';
+      overlay.classList.toggle('rt-dim', !!store.settings.dim);
+    }
+  }
+
+  function toggleDim() {
+    store.settings.dim = !store.settings.dim;
+    saveStore();
+    applyStealth();
+    toast(store.settings.dim ? '标记改为半透明（悬停清晰）' : '标记改为常显');
+  }
+
+  // 位置微调：整体偏移，用于适配特殊布局
+  function askOffset() {
+    const off = offsetSetting();
+    const cur = off.x + ',' + off.y;
+    const v = window.prompt('设置标记整体偏移（格式：水平,垂直，单位 px，可为负数）\n例如 40,0 表示整体右移 40px', cur);
+    if (v == null) return;
+    const m = String(v).match(/(-?\d+)\s*[,，]\s*(-?\d+)/);
+    if (!m) { toast('格式不正确，示例：40,0'); return; }
+    store.settings.offset = { x: Math.max(-400, Math.min(400, +m[1])), y: Math.max(-400, Math.min(400, +m[2])) };
+    saveStore();
+    requestLayout();
+    toast('偏移已设为 ' + store.settings.offset.x + ',' + store.settings.offset.y);
+  }
+
+  function resetOffset() {
+    store.settings.offset = { x: 0, y: 0 };
+    saveStore();
+    requestLayout();
+    toast('偏移已重置');
   }
 
   function toggleStealth() {
@@ -1149,13 +1304,15 @@
   function injectStyle() {
     const css = [
       '#rt-overlay{position:fixed;left:0;top:0;width:0;height:0;overflow:visible;z-index:2147483000;pointer-events:none}',
-      '.rt-box{position:absolute;left:0;top:0;display:inline-flex;align-items:center;gap:4px;pointer-events:auto;opacity:.55;transition:opacity .15s;white-space:nowrap;overflow:hidden;font-family:inherit!important;line-height:1.2}',
-      '.rt-box:hover{opacity:1}',
-      '.rt-chip{display:inline-flex;align-items:center;min-width:0;max-width:120px;height:18px;padding:0 7px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none;box-sizing:border-box;box-shadow:0 1px 4px rgba(0,0,0,.25)}',
+      '.rt-box{position:absolute;left:0;top:0;display:inline-flex;align-items:center;gap:4px;pointer-events:auto;opacity:1;transition:opacity .15s;white-space:nowrap;overflow:hidden;font-family:inherit!important;line-height:1.2}',
+      '.rt-box:hover{opacity:1;filter:brightness(1.08)}',
+      '#rt-overlay.rt-dim .rt-box{opacity:.55}',
+      '#rt-overlay.rt-dim .rt-box:hover{opacity:1}',
+      '.rt-chip{display:inline-flex;align-items:center;min-width:0;max-width:120px;height:18px;padding:0 7px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;font-weight:500;line-height:18px;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none;box-sizing:border-box;box-shadow:0 1px 5px rgba(0,0,0,.45)}',
       '.rt-chip:hover{filter:brightness(1.1)}',
       '.rt-chip--more{background:#8a8a8a}',
-      '.rt-mini{display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;line-height:18px;cursor:pointer;user-select:none;box-shadow:0 1px 4px rgba(0,0,0,.25)}',
-      '.rt-mini--add{background:rgba(255,255,255,.92);color:#fb7299!important;border:1px solid #fb7299}',
+      '.rt-mini{display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;font-weight:500;line-height:18px;cursor:pointer;user-select:none;box-shadow:0 1px 5px rgba(0,0,0,.45)}',
+      '.rt-mini--add{background:#fff;color:#fb7299!important;border:1px solid #fb7299;box-shadow:0 1px 5px rgba(0,0,0,.45)}',
       '.rt-panel{position:fixed;z-index:2147483100;width:360px;max-height:72vh;overflow:auto;background:#fff;color:#222;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.28);font-size:13px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.5}',
       '.rt-panel--mgr{width:520px}',
       '.rt-panel-hd{position:sticky;top:0;display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#fb7299;color:#fff;font-weight:600;border-radius:10px 10px 0 0}',
@@ -1265,6 +1422,9 @@
       GM_registerMenuCommand('打开标记管理面板', openManager);
       GM_registerMenuCommand('切换隐身模式（Alt+Shift+M）', toggleStealth);
       GM_registerMenuCommand('开启/关闭页面渲染（排查用）', toggleEnabled);
+      GM_registerMenuCommand('标记显示：常显 / 半透明', toggleDim);
+      GM_registerMenuCommand('位置微调（整体偏移）', askOffset);
+      GM_registerMenuCommand('重置位置偏移', resetOffset);
       GM_registerMenuCommand('立即重新定位标记', () => { scan(); toast('已重新定位'); });
       GM_registerMenuCommand('导出标记数据（JSON）', exportJSON);
       GM_registerMenuCommand('导入标记数据（JSON）', () => {
@@ -1290,5 +1450,13 @@
   }
 
   // 供测试使用
-  window.__rt = { computePos: computePos, targets: targets, store: () => store };
+  window.__rt = {
+    computePos: computePos,
+    targets: targets,
+    store: () => store,
+    isAvatarLink: isAvatarLink,
+    dedupeAnchors: dedupeAnchors,
+    isSpacePage: isSpacePage,
+    spaceUid: spaceUid,
+  };
 })();
