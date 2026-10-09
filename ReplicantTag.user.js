@@ -2,16 +2,25 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.0.0
+// @version      1.0.1
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片头像与标题之间，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
+// @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once; tags render inline next to the comment level badge or between the card title and the UP name. Stealth mode hides every injected element, JSON export/import included. Bilibili only for now, more sites planned. This script is written by AI.
 // @author       saiyajiang
+// @license      MIT
+// @homepageURL  https://github.com/saiyajiang/ReplicantTag
+// @supportURL   https://github.com/saiyajiang/ReplicantTag/issues
+// @downloadURL  https://raw.githubusercontent.com/saiyajiang/ReplicantTag/main/ReplicantTag.user.js
+// @updateURL    https://raw.githubusercontent.com/saiyajiang/ReplicantTag/main/ReplicantTag.user.js
 // @match        *://*.bilibili.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @run-at       document-idle
-// @license      MIT
+// @icon         https://raw.githubusercontent.com/saiyajiang/ReplicantTag/main/icon.svg
+// @tag          bilibili
+// @tag          productivity
+// @tag          标记
 // ==/UserScript==
 
 /*
