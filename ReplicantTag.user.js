@@ -4,7 +4,7 @@
 // @namespace    https://github.com/saiyajiang/ReplicantTag
 // @version      1.0.0
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片头像与标题之间，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
-// @author       AI-generated script
+// @author       saiyajiang
 // @match        *://*.bilibili.com/*
 // @grant        GM_setValue
 // @grant        GM_getValue
