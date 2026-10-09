@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.3.0
+// @version      1.4.0
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -16,6 +16,7 @@
 // @grant        GM_getValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @run-at       document-idle
 // @icon         https://raw.githubusercontent.com/saiyajiang/ReplicantTag/main/icon.svg
 // @tag          bilibili
@@ -46,7 +47,7 @@
  * 向其内部插入外部节点会破坏框架的 DOM 协调，导致整块评论区被卸载。
  */
 
-/* global GM_setValue, GM_getValue, GM_addStyle, GM_registerMenuCommand */
+/* global GM_setValue, GM_getValue, GM_addStyle, GM_registerMenuCommand, GM_unregisterMenuCommand */
 
 (function () {
   'use strict';
@@ -664,6 +665,44 @@
     });
   }
 
+  // UP / 空间页里的操作按钮（充电、关注等），标记必须避开它们
+  const BTN_SEL = ['button', '.btn', '[class*="btn"]', '[class*="follow"]', '[class*="charge"]', '[class*="attention"]', '[class*="guanzhu"]'];
+
+  function avoidRects(host, a) {
+    const out = [];
+    const roots = [];
+    const tryPush = (el) => { if (el) roots.push(el.shadowRoot || el); };
+    tryPush(host);
+    if (host && host.parentElement) roots.push(host.parentElement);
+    if (a && a.parentElement) roots.push(a.parentElement);
+    for (const r of roots) {
+      let els;
+      try { els = r.querySelectorAll(BTN_SEL.join(',')); } catch (e) { continue; }
+      for (const el of els) {
+        const rc = rectOf(el);
+        if (!rc) continue;
+        let dup = false;
+        for (const x of out) {
+          if (Math.abs(x.left - rc.left) < 3 && Math.abs(x.top - rc.top) < 3) { dup = true; break; }
+        }
+        if (dup) continue;
+        out.push(rc);
+        if (out.length >= 8) break;
+      }
+      if (out.length >= 8) break;
+    }
+    return out;
+  }
+
+  // 矩形是否相交（标记框 vs 按钮）
+  function collides(left, top, bw, bh, avoids) {
+    if (!avoids || !avoids.length) return false;
+    for (const a of avoids) {
+      if (left < a.right && left + bw > a.left && top < a.bottom && top + bh > a.top) return true;
+    }
+    return false;
+  }
+
   // 定位参考元素
   function refRects(rec) {
     const a = rec.a;
@@ -684,10 +723,16 @@
     }
 
     if (rec.scene === 'space') {
-      // 用户空间页：放在昵称右侧的空白区
+      // 用户空间页：紧贴昵称右侧，且避开充电/关注等按钮
       let cont = null;
       try { cont = rec.host && rec.host.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
-      return { main: aRect, container: (cont && cont.width ? cont : null), mode: 'right' };
+      if (!cont || !cont.width) cont = null;
+      return {
+        main: aRect, name: aRect, container: cont,
+        limit: cont ? cont.right : (window.innerWidth - 6),
+        avoids: avoidRects(rec.host, a),
+        mode: 'nameRight',
+      };
     }
 
     if (rec.scene === 'up') {
@@ -709,6 +754,8 @@
         main: hostRect && (hostRect.width || hostRect.height) ? hostRect : aRect,
         guard: avRect && (avRect.width || avRect.height) ? avRect : aRect,
         text: textRect,
+        name: aRect,
+        avoids: avoidRects(host, a),
         mode: 'up',
       };
     }
@@ -728,27 +775,65 @@
   function computePos(mode, rects, bw, bh, vw) {
     const main = rects.main;
     const guard = rects.guard || main;
+    const text = rects.text || guard;
+    const name = rects.name || main;
+    const avoids = rects.avoids || [];
     const off = offsetSetting();
     let left, top, maxW = 0;
+
+    const free = (x, y) => !collides(x, y, bw, bh, avoids);
+
     if (mode === 'up') {
-      top = main.top + (main.height - bh) / 2;
-      const text = rects.text || guard;
-      // 候选 A：UP 面板最左内侧的空白处（红框位置）—— 只有放得下完整内容才用，
-      // 否则会截断；放不下就换候选，绝不压缩成"半个标记"。
+      // 候选 A：UP 面板最左内侧的空白处（红框位置）——放得下完整内容才用，绝不压缩
       const availLeft = guard.left - main.left - 8;
-      if (availLeft >= bw + 4) {
+      const ay = main.top + (main.height - bh) / 2;
+      if (availLeft >= bw + 4 && free(main.left + 2, ay)) {
         left = main.left + 2;
+        top = ay;
       } else {
-        // 候选 B：头像与文字块右侧的空白区
-        const cand = Math.max(guard.right, text.right) + 8;
-        const limit = Math.min(main.right, vw) - 6;
-        if (cand + bw <= limit) {
-          left = cand;
-        } else {
-          // 候选 C：UP 面板下方（不遮挡头像、昵称与简介）
-          left = main.left;
-          top = main.bottom + 4;
+        // 候选 B：昵称右侧（与昵称同一水平线），必须避开充电/关注按钮
+        const by = name.top + (name.height - bh) / 2;
+        // B1 紧贴昵称；B2 若紧贴处正好是按钮，则退到按钮之后（同一行）
+        let afterBtn = name.right;
+        for (const b of avoids) {
+          if (b.bottom > name.top - 4 && b.top < name.bottom + 4 && b.right > afterBtn) afterBtn = b.right;
         }
+        const cands = [name.right + 8, afterBtn + 8];
+        let placed = false;
+        for (const bx of cands) {
+          if (bx + bw <= Math.min(main.right, vw) - 6 && free(bx, by)) {
+            left = bx; top = by; placed = true; break;
+          }
+        }
+        if (!placed) {
+          // 候选 C：昵称下方（不遮挡头像、昵称与按钮）
+          const cy = name.bottom + 4;
+          if (free(name.left, cy)) {
+            left = name.left;
+            top = cy;
+          } else {
+            // 候选 D：整个 UP 面板下方
+            left = main.left;
+            top = main.bottom + 4;
+          }
+        }
+      }
+    } else if (mode === 'nameRight') {
+      // 空间页：紧贴昵称右侧，与昵称同高；压到按钮就退到按钮之后；都放不下才退到昵称下方
+      const limit = Math.min(rects.limit || main.right, vw) - 6;
+      const by = name.top + (name.height - bh) / 2;
+      let afterBtn = name.right;
+      for (const b of avoids) {
+        if (b.bottom > name.top - 4 && b.top < name.bottom + 4 && b.right > afterBtn) afterBtn = b.right;
+      }
+      let placed = false;
+      for (const bx of [name.right + 8, afterBtn + 8]) {
+        if (bx + bw <= limit && free(bx, by)) { left = bx; top = by; placed = true; break; }
+      }
+      if (!placed) {
+        const cy = name.bottom + 4;
+        left = name.left;
+        top = free(left, cy) ? cy : (text.bottom || name.bottom) + 4;
       }
     } else if (mode === 'right') {
       top = main.top + (main.height - bh) / 2;
@@ -1313,7 +1398,7 @@
         h('div', { class: 'rt-actions' }, [
           h('button', { class: 'rt-btn', text: '导出 JSON', onclick: exportJSON }),
           h('button', { class: 'rt-btn', text: '导入 JSON', onclick: () => fileInput.click() }),
-          h('button', { class: 'rt-btn', id: 'rt-btn-stealth', text: store.settings.stealth ? '隐身模式：开' : '隐身模式：关', onclick: (ev) => { toggleStealth(); ev.target.textContent = store.settings.stealth ? '隐身模式：开' : '隐身模式：关'; } }),
+          h('button', { class: 'rt-btn', id: 'rt-btn-stealth', text: visibilityLabel(), onclick: (ev) => { toggleStealth(); ev.target.textContent = visibilityLabel(); } }),
           h('button', { class: 'rt-btn', id: 'rt-btn-enable', text: store.settings.enabled ? '页面渲染：开' : '页面渲染：关', onclick: (ev) => { toggleEnabled(); ev.target.textContent = store.settings.enabled ? '页面渲染：开' : '页面渲染：关'; } }),
           h('button', { class: 'rt-btn', id: 'rt-btn-dim', text: store.settings.dim ? '标记显示：半透明' : '标记显示：常显', onclick: (ev) => { toggleDim(); ev.target.textContent = store.settings.dim ? '标记显示：半透明' : '标记显示：常显'; } }),
           h('button', { class: 'rt-btn', text: '位置微调', onclick: askOffset }),
@@ -1332,7 +1417,7 @@
             },
           }),
         ]),
-        h('div', { class: 'rt-dim', text: '隐身模式：隐藏页面上全部标记（照常记录）。页面渲染：完全停止浮层，用于排查页面异常。' }),
+        h('div', { class: 'rt-dim', text: '显示/隐藏：切换页面上标记的显示（隐藏时照常记录）。页面渲染：完全停止浮层，用于排查页面异常。' }),
         listBox,
         fileInput,
       ]),
@@ -1423,6 +1508,7 @@
     store.settings.dim = !store.settings.dim;
     saveStore();
     applyStealth();
+    refreshDimMenu();
     toast(store.settings.dim ? '标记改为半透明（悬停清晰）' : '标记改为常显');
   }
 
@@ -1451,13 +1537,16 @@
     store.settings.stealth = !store.settings.stealth;
     saveStore();
     applyStealth();
-    toast(store.settings.stealth ? '隐身模式：已开启（页面不再显示标记）' : '隐身模式：已关闭');
+    refreshVisibilityMenu();
+    toast(store.settings.stealth ? '已隐藏页面上的标记（照常记录）' : '已显示页面上的标记');
   }
 
   function toggleEnabled() {
     store.settings.enabled = !store.settings.enabled;
     saveStore();
     applyStealth();
+    refreshVisibilityMenu();
+    refreshRenderMenu();
     if (store.settings.enabled) scan();
     toast(store.settings.enabled ? '页面渲染：已开启' : '页面渲染：已关闭（数据仍可管理）');
   }
@@ -1585,16 +1674,16 @@
     }, true);
 
     if (typeof GM_registerMenuCommand === 'function') {
-      GM_registerMenuCommand('打开标记管理面板', openManager);
-      GM_registerMenuCommand('切换隐身模式（Alt+Shift+M）', toggleStealth);
-      GM_registerMenuCommand('开启/关闭页面渲染（排查用）', toggleEnabled);
-      GM_registerMenuCommand('标记显示：常显 / 半透明', toggleDim);
-      GM_registerMenuCommand('清理历史留痕中的样式代码', purgeCSS);
-      GM_registerMenuCommand('位置微调（整体偏移）', askOffset);
-      GM_registerMenuCommand('重置位置偏移', resetOffset);
-      GM_registerMenuCommand('立即重新定位标记', () => { scan(); toast('已重新定位'); });
-      GM_registerMenuCommand('导出标记数据（JSON）', exportJSON);
-      GM_registerMenuCommand('导入标记数据（JSON）', () => {
+      menuLabel('manager', '打开标记管理面板', openManager);
+      refreshVisibilityMenu();
+      menuLabel('render', '页面渲染：' + (store.settings.enabled ? '开' : '关') + '（排查用）', toggleEnabled);
+      menuLabel('dim', '标记显示：' + (store.settings.dim ? '半透明' : '常显'), toggleDim);
+      menuLabel('purge', '清理历史留痕中的样式代码', purgeCSS);
+      menuLabel('offset', '位置微调（整体偏移）', askOffset);
+      menuLabel('resetOffset', '重置位置偏移', resetOffset);
+      menuLabel('relocate', '立即重新定位标记', () => { scan(); toast('已重新定位'); });
+      menuLabel('export', '导出标记数据（JSON）', exportJSON);
+      menuLabel('import', '导入标记数据（JSON）', () => {
         const inp = h('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
         inp.addEventListener('change', () => {
           const f = inp.files && inp.files[0];
@@ -1608,6 +1697,39 @@
         setTimeout(() => inp.remove(), 3000);
       });
     }
+  }
+
+  /* ---------------- 菜单项（可刷新标题以显示当前状态） ---------------- */
+
+  const menuIds = {};
+
+  // 反注册 + 重新注册，让菜单标题能反映最新状态
+  function menuLabel(key, label, fn) {
+    try {
+      if (menuIds[key] != null && typeof GM_unregisterMenuCommand === 'function') GM_unregisterMenuCommand(menuIds[key]);
+    } catch (e) { /* 部分管理器不支持反注册，忽略 */ }
+    try {
+      menuIds[key] = GM_registerMenuCommand(label, fn);
+    } catch (e) { /* 忽略 */ }
+    return menuIds[key];
+  }
+
+  // 显示/隐藏：标题始终带当前状态
+  function visibilityLabel() {
+    if (!store.settings.enabled) return '显示标记（当前：已关闭渲染）';
+    return store.settings.stealth ? '显示标记（当前：已隐藏）' : '隐藏标记（当前：显示中）';
+  }
+
+  function refreshVisibilityMenu() {
+    menuLabel('visibility', visibilityLabel() + '　Alt+Shift+M', toggleStealth);
+  }
+
+  function refreshRenderMenu() {
+    menuLabel('render', '页面渲染：' + (store.settings.enabled ? '开' : '关') + '（排查用）', toggleEnabled);
+  }
+
+  function refreshDimMenu() {
+    menuLabel('dim', '标记显示：' + (store.settings.dim ? '半透明' : '常显'), toggleDim);
   }
 
   if (document.readyState === 'loading') {
@@ -1629,5 +1751,7 @@
     looksLikeCSS: looksLikeCSS,
     commentContent: commentContent,
     purgeCSS: purgeCSS,
+    visibilityLabel: visibilityLabel,
+    collides: collides,
   };
 })();
