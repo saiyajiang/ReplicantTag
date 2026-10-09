@@ -258,6 +258,27 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(upBelow.top >= 734, '整行被按钮占满时退到昵称下方: top=' + upBelow.top);
   assert(!rt.collides(upBelow.left, upBelow.top, 60, 18, [upFullBtn]), '下方方案未压到按钮');
 
+  // 卡片标记：UP 名这一行的右侧，不再盖住名字
+  const cardOwnerRow = { left: 200, top: 545, right: 500, bottom: 565, width: 300, height: 20 };
+  const cardUpName = { left: 200, top: 545, right: 320, bottom: 565, width: 120, height: 20 };
+  const pCard = rt.computePos('cardRight', {
+    main: cardUpName, name: cardUpName, text: cardOwnerRow,
+    container: { left: 180, top: 400, right: 520, bottom: 570, width: 340, height: 170 },
+    limit: 516, avoids: [],
+  }, 60, 18, 1440);
+  assert(pCard.left === 328, '卡片标记紧贴 UP 名右侧: left=' + pCard.left);
+  assert(pCard.top >= 545 && pCard.top <= 565, '与 UP 名同一行: top=' + pCard.top);
+  assert(pCard.left >= cardUpName.right, '未盖住 UP 名（在名字右边界之外）');
+  assert(pCard.left + 60 <= 516, '未越出卡片右边界: ' + (pCard.left + 60));
+  // 名字太长占满一行：退到名字下方，而不是压在名字上
+  const longName = { left: 200, top: 545, right: 500, bottom: 565, width: 300, height: 20 };
+  const pCardLong = rt.computePos('cardRight', {
+    main: longName, name: longName, text: cardOwnerRow,
+    container: { left: 180, top: 400, right: 520, bottom: 575, width: 340, height: 175 },
+    limit: 516, avoids: [],
+  }, 60, 18, 1440);
+  assert(pCardLong.top >= 565, '名字占满一行时退到名字下方: top=' + pCardLong.top);
+
   // UP 定位回归
   const pUp = rt.computePos('up', { main: { left: 300, top: 1050, right: 800, bottom: 1110, width: 500, height: 60 }, guard: { left: 352, top: 1055, right: 400, bottom: 1103, width: 48, height: 48 }, text: { left: 410, top: 1070, right: 530, bottom: 1090, width: 120, height: 20 } }, 40, 18, 1440);
   assert(pUp.left === 302, 'UP 标记仍在面板最左内侧: ' + JSON.stringify(pUp));
