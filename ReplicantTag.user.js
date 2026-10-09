@@ -2,9 +2,9 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.0.1
-// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片头像与标题之间，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
-// @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once; tags render inline next to the comment level badge or between the card title and the UP name. Stealth mode hides every injected element, JSON export/import included. Bilibili only for now, more sites planned. This script is written by AI.
+// @version      1.1.0
+// @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
+// @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
 // @license      MIT
 // @homepageURL  https://github.com/saiyajiang/ReplicantTag
@@ -40,6 +40,10 @@
  * 如何使用它，取决于你。
  *
  * 当前支持站点：哔哩哔哩（bilibili.com）。后续计划扩展至更多站点，架构已按多站点预留。
+ *
+ * 实现说明（1.1.0）：所有页面内标记均渲染在独立的浮层（overlay）中，脚本绝不向
+ * 页面自身的 DOM / Shadow DOM 插入、移动或删除任何节点。B站评论区由前端框架渲染，
+ * 向其内部插入外部节点会破坏框架的 DOM 协调，导致整块评论区被卸载。
  */
 
 /* global GM_setValue, GM_getValue, GM_addStyle, GM_registerMenuCommand */
@@ -54,23 +58,32 @@
   const MAX_TAG_LIB = 500;         // 历史标记（下拉候选）上限
   const MAX_CHIPS = 3;             // 页面上最多直接展示的标记个数，其余折叠为 +N
   const SHADOW_DEPTH = 4;          // 递归下潜 Shadow DOM 的层数（B站新组件是 Web Component）
+  const MAX_BOXES = 400;           // 浮层里同时渲染的标记框上限，超出按视口距离淘汰
 
   const LINK_SEL = 'a[href*="space.bilibili.com/"]';
-  const CARD_SEL = ['bili-video-card', '.bili-video-card', '.video-card', '.small-item', '.cover'];
-  const UP_SEL = ['.up-panel-container', '.up-info-container', '.up-detail-container', '.up-info--container', '.video-owner', '[class*="up-info"]', '.up-box', '.bili-video-owner'];
-  const COMMENT_SEL = ['bili-comment', 'bili-comment-thread-renderer', 'bili-comment-reply-renderer', '#comment', '.comment', '.reply-wrap', '.reply-item', '[class*="comment"]', '[class*="reply"]'];
+  const CARD_SEL = ['bili-video-card', '.bili-video-card', '.video-card', '.small-item'];
+  const UP_SEL = [
+    '.up-panel-container', '.up-info-container', '.up-detail-container', '.up-info--container',
+    '.video-owner', '[class*="up-info"]', '.up-box', 'bili-video-owner', 'bili-watch-side-owner',
+    '.bili-video-owner', '.member-info', '.upper-row',
+  ];
+  const COMMENT_SEL = [
+    'bili-comment', 'bili-comment-thread-renderer', 'bili-comment-reply-renderer',
+    '#comment', '.reply-wrap', '.reply-item', '[class*="comment"]', '[class*="reply"]',
+  ];
   const LEVEL_SEL = ['bili-comment-user-level', '.level', '.user-level', '[class*="level"]'];
+  const AVATAR_SEL = ['.bili-avatar', '[class*="avatar"]', 'img'];
   const TITLE_SEL = ['h1.video-title', '.video-title', '.tit', '.title'];
+  const CARD_TITLE_SEL = ['.bili-video-card__info--tit', '[class*="info--tit"]', '.bili-video-card__info--title', '.title', '.tit'];
   const PUBDATE_SEL = ['[class*="pubdate"]', '[class*="pub-date"]', '.video-data .date', '.bili-video-info__date'];
 
   /* ====================== 存储 ====================== */
 
-  const DEFAULT_STORE = { users: {}, tagLib: [], settings: { stealth: false }, rev: 0 };
   let store = readStore();
   let storeRev = store.rev || 0;
 
   function blankStore() {
-    return { users: {}, tagLib: [], settings: { stealth: false }, rev: 0 };
+    return { users: {}, tagLib: [], settings: { stealth: false, enabled: true }, rev: 0 };
   }
 
   function readStore() {
@@ -83,7 +96,7 @@
       return {
         users: (o && o.users) || {},
         tagLib: (o && o.tagLib) || [],
-        settings: Object.assign({ stealth: false }, (o && o.settings) || {}),
+        settings: Object.assign({ stealth: false, enabled: true }, (o && o.settings) || {}),
         rev: (o && o.rev) || 0,
       };
     } catch (e) {
@@ -100,7 +113,7 @@
     try { GM_setValue(STORE_KEY, raw); } catch (e) { /* 忽略 */ }
     try { localStorage.setItem(STORE_KEY, raw); } catch (e) { /* 忽略 */ }
     applyStealth();
-    refreshAllSlots();
+    refreshAllBoxes();
   }
 
   function getUser(uid, nickname) {
@@ -126,7 +139,7 @@
     if (store.tagLib.length > MAX_TAG_LIB) store.tagLib = store.tagLib.slice(-MAX_TAG_LIB);
     u.items.unshift({
       id: 'i' + Date.now() + Math.random().toString(36).slice(2, 6),
-      type: ctx.type,                 // 'video' | 'comment'
+      type: ctx.type,                 // 'video' | 'comment' | 'manual'
       tags: tags.slice(),
       bv: ctx.bv || '',
       title: ctx.title || '',
@@ -210,9 +223,9 @@
     return list;
   }
 
-  // 收集所有需要搜索的根：document + 各层 ShadowRoot
-  function collectRoots() {
-    const roots = [document];
+  // 遍历 document 及所有 ShadowRoot（只读，绝不修改）
+  function forEachRoot(cb) {
+    cb(document);
     let frontier = [document];
     for (let d = 0; d < SHADOW_DEPTH; d++) {
       const next = [];
@@ -220,20 +233,19 @@
         let els;
         try { els = root.querySelectorAll('*'); } catch (e) { continue; }
         for (const el of els) {
-          if (el.shadowRoot) { roots.push(el.shadowRoot); next.push(el.shadowRoot); }
+          if (el.shadowRoot) { cb(el.shadowRoot); next.push(el.shadowRoot); }
         }
       }
       if (!next.length) break;
       frontier = next;
     }
-    return roots;
   }
 
   function deepFindFirst(root, sels) {
     if (!root) return null;
     const queue = [root];
-    let depth = 0;
-    while (queue.length && depth < SHADOW_DEPTH * 20) {
+    let guard = 0;
+    while (queue.length && guard++ < 40) {
       const r = queue.shift();
       let els;
       try { els = r.querySelectorAll('*'); } catch (e) { continue; }
@@ -241,7 +253,6 @@
         if (matches(el, sels)) return el;
         if (el.shadowRoot) queue.push(el.shadowRoot);
       }
-      depth++;
     }
     return null;
   }
@@ -271,16 +282,20 @@
     return m ? m[1] : '';
   }
 
+  function hrefOf(a) {
+    try { return a.getAttribute('href') || a.href || ''; } catch (e) { return ''; }
+  }
+
   function bvFromHost(host) {
     if (!host) return '';
     const a = deepFindFirst(host.shadowRoot || host, ['a[href*="/video/BV"]', 'a[href*="bilibili.com/video"]']);
     if (a) {
-      const m = String(a.getAttribute('href') || a.href || '').match(/(BV[0-9A-Za-z]{10})/);
+      const m = hrefOf(a).match(/(BV[0-9A-Za-z]{10})/);
       if (m) return m[1];
     }
     if (host.getAttribute) {
       const attr = host.getAttribute('bvid') || host.getAttribute('data-bvid') || host.getAttribute('data-bv');
-      if (attr) return attr;
+      if (attr) return String(attr);
     }
     return '';
   }
@@ -314,9 +329,11 @@
     };
     const card = findInChain(CARD_SEL);
     if (card) return { scene: 'card', host: card };
+    const cmt = findInChain(COMMENT_SEL);
+    // 评论优先于 UP：评论区里也会出现 UP 标识
+    if (cmt && !findInChain(UP_SEL)) return { scene: 'comment', host: cmt };
     const up = findInChain(UP_SEL);
     if (up) return { scene: 'up', host: up };
-    const cmt = findInChain(COMMENT_SEL);
     if (cmt) return { scene: 'comment', host: cmt };
     return null;
   }
@@ -332,10 +349,24 @@
     return null;
   }
 
-  function buildCtx(a) {
-    const host = a.__rtHost;
-    const scene = a.__rtScene;
-    if (scene === 'comment') {
+  function findAvatar(host, a) {
+    const root = host && (host.shadowRoot || host);
+    if (root) {
+      const av = deepFindFirst(root, AVATAR_SEL);
+      if (av) return av;
+    }
+    return a;
+  }
+
+  function findCardTitle(host) {
+    const root = host && (host.shadowRoot || host);
+    if (!root) return null;
+    return deepFindFirst(root, CARD_TITLE_SEL);
+  }
+
+  function buildCtx(rec) {
+    const host = rec.host;
+    if (rec.scene === 'comment') {
       const body = deepFindFirst(host && (host.shadowRoot || host), ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '[class*="content"]']);
       return {
         type: 'comment',
@@ -349,135 +380,251 @@
     return {
       type: 'video',
       bv: bvFromHost(host) || currentBV(),
-      title: textOf(deepFindFirst(host && (host.shadowRoot || host), ['.bili-video-card__info--tit', '[class*="info--tit"]', '.title', '.tit'])) || currentTitle(),
+      title: textOf(findCardTitle(host)) || currentTitle(),
       videoTime: textOf(deepFindFirst(host && (host.shadowRoot || host), ['[class*="date"]', '[class*="time"]'])) || currentPubDate(),
       content: '',
       url: location.href,
     };
   }
 
-  /* ====================== 页面内标记展示 ====================== */
+  /* ====================== 浮层渲染（不向页面插入任何节点） ====================== */
 
-  const slotRecords = []; // { a, slot, rev }
+  let overlay = null;
+  const targets = new Map(); // anchor -> rec
 
-  function ensureSlot(a) {
-    if (a.__rtSlot && a.__rtSlot.isConnected) return a.__rtSlot;
-    const c = classify(a);
-    if (!c) return null;
-    const uid = uidFromHref(a.getAttribute('href') || a.href || '');
-    if (!uid) return null;
-    const nick = (textOf(a) || a.getAttribute('title') || '').slice(0, 60);
-
-    a.__rtUid = uid;
-    a.__rtNick = nick;
-    a.__rtScene = c.scene;
-    a.__rtHost = c.host;
-
-    const slot = h('span', { class: 'rt-slot', 'data-uid': uid });
-    if (!insertSlot(a, slot, c)) return null;
-    a.__rtSlot = slot;
-    slotRecords.push({ a: a, slot: slot, rev: -1 });
-    renderSlot(a);
-    return slot;
+  function ensureOverlay() {
+    if (overlay && overlay.isConnected) return overlay;
+    overlay = h('div', { class: 'rt-overlay', id: 'rt-overlay' });
+    // 挂到 documentElement：避免 body 上的 transform/filter 影响 fixed 定位
+    (document.documentElement || document.body).appendChild(overlay);
+    return overlay;
   }
 
-  function insertSlot(a, slot, c) {
-    try {
-      if (c.scene === 'comment') {
-        const lv = findLevel(a);
-        if (lv && lv.parentNode) { lv.parentNode.insertBefore(slot, lv.nextSibling); return true; }
-        if (a.parentNode) { a.parentNode.insertBefore(slot, a.nextSibling); return true; }
-        return false;
-      }
-      if (c.scene === 'up') {
-        // 播放页：插在 UP 面板上方（即视频标题与 UP 头像之间）
-        const upHost = c.host;
-        if (upHost && upHost.parentNode && upHost.parentNode.nodeType === 1) {
-          upHost.parentNode.insertBefore(slot, upHost);
-          return true;
-        }
-        if (a.parentNode) { a.parentNode.insertBefore(slot, a.nextSibling); return true; }
-        return false;
-      }
-      // card：视频卡片，插在标题与 UP 行（头像+昵称）之间
-      const root = (c.host && (c.host.shadowRoot || c.host)) || document;
-      const title = deepFindFirst(root, ['.bili-video-card__info--tit', '[class*="info--tit"]', '.bili-video-card__info--title', '.title']);
-      const owner = deepFindFirst(root, ['.bili-video-card__info--owner', '[class*="info--owner"]', '[class*="info--author"]', '.up-name']) || a;
-      if (title && owner && title !== owner && title.parentNode === owner.parentNode) {
-        const pos = title.compareDocumentPosition(owner);
-        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) title.parentNode.insertBefore(slot, title.nextSibling);
-        else owner.parentNode.insertBefore(slot, owner.nextSibling);
-        return true;
-      }
-      if (owner && owner.parentNode) { owner.parentNode.insertBefore(slot, owner.nextSibling); return true; }
-      if (a.parentNode) { a.parentNode.insertBefore(slot, a.nextSibling); return true; }
-      return false;
-    } catch (e) {
-      return false;
-    }
+  function makeBox(rec) {
+    const box = h('span', { class: 'rt-box', 'data-scene': rec.scene });
+    box.__rtRec = rec;
+    box.addEventListener('click', (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      openPanel(rec);
+    });
+    return box;
   }
 
-  function chip(text, onClick, title) {
-    return h('span', {
-      class: 'rt-chip',
-      title: title || text,
-      onclick: onClick,
-    }, [text.length > 12 ? text.slice(0, 12) + '…' : text]);
-  }
-
-  function renderSlot(a) {
-    const slot = a.__rtSlot;
-    if (!slot) return;
-    const uid = a.__rtUid;
-    const u = store.users[uid];
-    while (slot.firstChild) slot.removeChild(slot.firstChild);
-    if (u && u.tags && u.tags.length) {
-      u.tags.slice(0, MAX_CHIPS).forEach((t) => {
-        slot.appendChild(chip(t, (ev) => { ev.preventDefault(); ev.stopPropagation(); openPanel(a); }));
+  function renderBox(rec) {
+    const box = rec.box;
+    if (!box) return;
+    const u = store.users[rec.uid];
+    const tags = (u && u.tags) || [];
+    while (box.firstChild) box.removeChild(box.firstChild);
+    if (tags.length) {
+      tags.slice(0, MAX_CHIPS).forEach((t) => {
+        box.appendChild(h('span', { class: 'rt-chip', title: t }, [t.length > 12 ? t.slice(0, 12) + '…' : t]));
       });
-      if (u.tags.length > MAX_CHIPS) {
-        slot.appendChild(chip('+' + (u.tags.length - MAX_CHIPS), (ev) => {
-          ev.preventDefault(); ev.stopPropagation(); openPanel(a);
-        }, u.tags.join('、')));
+      if (tags.length > MAX_CHIPS) {
+        box.appendChild(h('span', { class: 'rt-chip rt-chip--more', title: tags.join('、') }, ['+' + (tags.length - MAX_CHIPS)]));
       }
-    }
-    if (!u || !u.tags || !u.tags.length) {
-      slot.appendChild(h('span', {
-        class: 'rt-btn-mini',
-        title: '给该用户添加标记',
-        onclick: (ev) => { ev.preventDefault(); ev.stopPropagation(); openPanel(a); },
-      }, ['＋标']));
+      box.appendChild(h('span', { class: 'rt-mini', title: '编辑该用户的标记' }, ['✎']));
     } else {
-      slot.appendChild(h('span', {
-        class: 'rt-btn-mini rt-btn-mini--ghost',
-        title: '编辑该用户的标记',
-        onclick: (ev) => { ev.preventDefault(); ev.stopPropagation(); openPanel(a); },
-      }, ['✎']));
+      box.appendChild(h('span', { class: 'rt-mini rt-mini--add', title: '给该用户添加标记（UID ' + rec.uid + '）' }, ['＋标']));
     }
   }
 
-  function refreshAllSlots() {
-    for (const rec of slotRecords) {
-      if (!rec.slot.isConnected) continue;
-      if (rec.rev !== storeRev) { renderSlot(rec.a); rec.rev = storeRev; }
+  function refreshAllBoxes() {
+    targets.forEach((rec) => {
+      if (rec.rev !== storeRev) { renderBox(rec); rec.rev = storeRev; }
+    });
+  }
+
+  // 定位参考元素
+  function refRects(rec) {
+    const a = rec.a;
+    let aRect = null;
+    try { aRect = a.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+    if (!aRect) return null;
+
+    if (rec.scene === 'comment') {
+      const lv = rec.level || findLevel(a);
+      rec.level = lv;
+      if (lv) {
+        let r = null;
+        try { r = lv.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+        if (r && (r.width || r.height)) return { main: r, mode: 'right' };
+      }
+      return { main: aRect, mode: 'right' };
     }
+
+    if (rec.scene === 'up') {
+      const host = rec.host;
+      let hostRect = null;
+      try { hostRect = host && host.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      const av = rec.avatar || findAvatar(host, a);
+      rec.avatar = av;
+      let avRect = null;
+      try { avRect = av && av.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      // 红框位置：UP 面板左侧内部；若空间不足会盖住头像，则退到头像左外侧
+      return {
+        main: hostRect && (hostRect.width || hostRect.height) ? hostRect : aRect,
+        guard: avRect && (avRect.width || avRect.height) ? avRect : aRect,
+        mode: 'up',
+      };
+    }
+
+    // card：标题下方
+    const t = rec.title || findCardTitle(rec.host);
+    rec.title = t;
+    if (t) {
+      let r = null;
+      try { r = t.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      if (r && (r.width || r.height)) return { main: r, mode: 'below' };
+    }
+    return { main: aRect, mode: 'below' };
+  }
+
+  // 纯函数：给定矩形与尺寸，算出浮标左上角坐标
+  function computePos(mode, rects, bw, bh, vw) {
+    const main = rects.main;
+    const guard = rects.guard || main;
+    let left, top, maxW = 0;
+    if (mode === 'up') {
+      // 始终放在 UP 面板最左内侧（红框位置）；宽度超出可用空间时靠 maxW 收敛，不整体外移
+      const hostL = main.left;
+      const avL = guard.left;
+      left = hostL + 2;
+      maxW = Math.max(28, Math.min(150, avL - hostL - 8));
+      top = main.top + (main.height - bh) / 2;
+    } else if (mode === 'right') {
+      left = main.right + 5;
+      top = main.top + (main.height - bh) / 2;
+      if (left + bw > vw - 6) {
+        const back = main.left - bw - 5;
+        left = back >= 6 ? back : Math.max(6, vw - bw - 6);
+      }
+    } else { // below
+      left = main.left;
+      top = main.bottom + 3;
+      if (left + bw > vw - 6) left = Math.max(6, vw - bw - 6);
+    }
+    left = Math.max(4, Math.min(left, Math.max(4, vw - bw - 4)));
+    top = Math.max(4, top);
+    return { left: Math.round(left), top: Math.round(top), maxW: maxW ? Math.round(maxW) : 0 };
+  }
+
+  function layout() {
+    if (!overlay || !overlay.isConnected) ensureOverlay();
+    if (!overlay) return;
+    const paused = !store.settings.enabled || store.settings.stealth;
+    if (paused) { overlay.style.display = 'none'; return; }
+    overlay.style.display = '';
+
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const shown = [];
+
+    targets.forEach((rec) => {
+      let box = rec.box;
+      if (!box) {
+        box = makeBox(rec);
+        rec.box = box;
+        rec.rev = -1;
+        overlay.appendChild(box);
+      }
+      if (rec.rev !== storeRev) { renderBox(rec); rec.rev = storeRev; }
+
+      if (!rec.a.isConnected) { box.style.display = 'none'; return; }
+      const rects = refRects(rec);
+      if (!rects) { box.style.display = 'none'; return; }
+      const m = rects.main;
+      if (m.bottom < -120 || m.top > vh + 120 || (!m.width && !m.height)) { box.style.display = 'none'; return; }
+
+      box.style.display = '';
+      const bw = box.offsetWidth || 40;
+      const bh = box.offsetHeight || 18;
+      const pos = computePos(rects.mode, rects, bw, bh, vw);
+      if (pos.maxW) box.style.maxWidth = pos.maxW + 'px';
+      else box.style.maxWidth = '';
+      box.style.transform = 'translate(' + pos.left + 'px,' + pos.top + 'px)';
+      shown.push({ rec, top: pos.top });
+    });
+
+    // 数量保护：超出上限时隐藏视口外的
+    if (shown.length > MAX_BOXES) {
+      shown.sort((x, y) => x.top - y.top);
+      for (let i = 0; i < shown.length - MAX_BOXES; i++) shown[i].rec.box.style.display = 'none';
+    }
+  }
+
+  /* ====================== 扫描 ====================== */
+
+  let scanTimer = null;
+  let layoutPending = false;
+
+  function scheduleScan() {
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 500);
+  }
+
+  function requestLayout() {
+    if (layoutPending) return;
+    layoutPending = true;
+    const run = () => { layoutPending = false; layout(); };
+    if (window.requestAnimationFrame) window.requestAnimationFrame(run);
+    else setTimeout(run, 16);
+  }
+
+  function scan() {
+    if (!document.body) return;
+    if (!store.settings.enabled) { if (overlay) overlay.style.display = 'none'; return; }
+
+    // 清理已失效的锚点
+    targets.forEach((rec, a) => {
+      if (!a.isConnected) {
+        if (rec.box && rec.box.parentNode) rec.box.parentNode.removeChild(rec.box);
+        targets.delete(a);
+      }
+    });
+
+    const seen = new Set();
+    forEachRoot((root) => {
+      let as;
+      try { as = root.querySelectorAll(LINK_SEL); } catch (e) { return; }
+      for (const a of as) {
+        if (targets.has(a)) { seen.add(a); continue; }
+        if (seen.has(a)) continue;
+        const uid = uidFromHref(hrefOf(a));
+        if (!uid) continue;
+        const c = classify(a);
+        if (!c) continue;
+        const nick = (textOf(a) || a.getAttribute('title') || '').slice(0, 60);
+        targets.set(a, { a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, box: null, rev: -1 });
+        seen.add(a);
+      }
+    });
+
+    const missing = [];
+    targets.forEach((rec, a) => { if (!seen.has(a)) missing.push(a); });
+    missing.forEach((a) => {
+      const rec = targets.get(a);
+      if (rec && rec.box && rec.box.parentNode) rec.box.parentNode.removeChild(rec.box);
+      targets.delete(a);
+    });
+
+    layout();
   }
 
   /* ====================== 标记面板 ====================== */
 
   let panel = null;
-  let panelAnchor = null;
 
   function closePanel() {
-    if (panel) { panel.remove(); panel = null; panelAnchor = null; }
+    if (panel) { panel.remove(); panel = null; }
   }
 
-  function openPanel(a) {
+  function openPanel(rec) {
     closePanel();
-    panelAnchor = a;
-    const uid = a.__rtUid;
-    const nick = a.__rtNick || (store.users[uid] && store.users[uid].nickname) || '';
-    const ctx = buildCtx(a);
+    const uid = rec.uid;
+    const nick = rec.nick || (store.users[uid] && store.users[uid].nickname) || '';
+    const ctx = buildCtx(rec);
     const u = store.users[uid];
 
     const tagBox = h('div', { class: 'rt-tags' });
@@ -531,7 +678,7 @@
           lines.push(h('div', { class: 'rt-item-line rt-item-meta' }, interleave(meta)));
         } else {
           lines.push(h('div', { class: 'rt-item-line rt-item-line--t' }, [
-            h('span', { class: 'rt-badge rt-badge--cmt', text: '评论' }),
+            h('span', { class: 'rt-badge rt-badge--cmt', text: it.type === 'comment' ? '评论' : '手动' }),
             h('span', { text: (it.content || '(无内容)').slice(0, 90) }),
           ]));
           lines.push(h('div', { class: 'rt-item-meta' }, [
@@ -552,15 +699,15 @@
     };
 
     const ctxBox = h('div', { class: 'rt-ctx' });
-    if (ctx.type === 'video') {
-      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '类型：' }), h('span', { text: '视频' })]));
-      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '标题：' }), h('span', { class: 'rt-v', text: (ctx.title || '(未识别)').slice(0, 80) })]));
-      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: 'BV号：' }), ctx.bv ? h('a', { class: 'rt-link', href: 'https://www.bilibili.com/video/' + ctx.bv, target: '_blank', rel: 'noreferrer', text: ctx.bv }) : h('span', { class: 'rt-dim', text: '(未识别)' })]));
-      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '时间：' }), h('span', { text: ctx.videoTime || fmtTime(Date.now()) })]));
-    } else {
+    if (ctx.type === 'comment') {
       ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '类型：' }), h('span', { text: '评论' })]));
       ctxBox.appendChild(h('div', { class: 'rt-ctx-row rt-ctx-cmt' }, [h('span', { class: 'rt-k', text: '内容：' }), h('span', { class: 'rt-v', text: (ctx.content || '(未识别)').slice(0, 160) })]));
       if (ctx.bv) ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '所在视频：' }), h('a', { class: 'rt-link', href: 'https://www.bilibili.com/video/' + ctx.bv, target: '_blank', rel: 'noreferrer', text: ctx.bv })]));
+    } else {
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '类型：' }), h('span', { text: rec.scene === 'up' ? '视频（UP主）' : '视频' })]));
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '标题：' }), h('span', { class: 'rt-v', text: (ctx.title || '(未识别)').slice(0, 80) })]));
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: 'BV号：' }), ctx.bv ? h('a', { class: 'rt-link', href: 'https://www.bilibili.com/video/' + ctx.bv, target: '_blank', rel: 'noreferrer', text: ctx.bv }) : h('span', { class: 'rt-dim', text: '(未识别)' })]));
+      ctxBox.appendChild(h('div', { class: 'rt-ctx-row' }, [h('span', { class: 'rt-k', text: '时间：' }), h('span', { text: ctx.videoTime || fmtTime(Date.now()) })]));
     }
 
     const doAdd = () => {
@@ -571,7 +718,6 @@
         input.value = '';
         refreshTags();
         renderItems();
-        renderSlot(a);
         hideDrop();
         toast('已添加 ' + n + ' 个标记');
       }
@@ -608,62 +754,60 @@
       drop.style.display = 'block';
     }
 
-    const body = h('div', { class: 'rt-panel-bd' }, [
-      h('div', { class: 'rt-user' }, [
-        h('div', { class: 'rt-nick', text: nick || '(未知昵称)' }),
-        h('div', { class: 'rt-uid' }, [
-          h('span', { text: 'UID ' + uid }),
-          h('a', { class: 'rt-link', href: 'https://space.bilibili.com/' + uid, target: '_blank', rel: 'noreferrer', text: '空间' }),
-          u ? h('span', { class: 'rt-dim', text: '· 已记录 ' + (u.items || []).length + ' 条' }) : null,
-        ]),
-      ]),
-      ctxBox,
-      h('div', { class: 'rt-sec-title', text: '该用户的标记' }),
-      tagBox,
-      h('div', { class: 'rt-input-row' }, [
-        h('div', { class: 'rt-input-wrap' }, [input, drop]),
-        h('button', { class: 'rt-btn rt-btn--primary', onclick: doAdd, text: '添加' }),
-      ]),
-      h('div', { class: 'rt-sec-title', text: '留痕记录' }),
-      itemBox,
-      h('div', { class: 'rt-actions' }, [
-        h('button', {
-          class: 'rt-btn',
-          text: '复制信息',
-          onclick: () => {
-            const cur = store.users[uid] || { tags: [], items: [] };
-            const txt = ['昵称：' + (cur.nickname || nick), 'UID：' + uid, '标记：' + (cur.tags || []).join('、')]
-              .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : '[评论] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || it.content || '') + (it.bv ? ' | ' + it.bv : '')))
-              .join('\n');
-            copyText(txt);
-          },
-        }),
-        h('button', { class: 'rt-btn rt-btn--danger', text: '删除该用户', onclick: () => { removeUser(uid); closePanel(); toast('已删除该用户'); } }),
-      ]),
-    ]);
-
     panel = h('div', { class: 'rt-panel' }, [
       h('div', { class: 'rt-panel-hd' }, [
         h('span', { text: '标记用户' }),
         h('span', { class: 'rt-x', title: '关闭', onclick: closePanel, text: '×' }),
       ]),
-      body,
+      h('div', { class: 'rt-panel-bd' }, [
+        h('div', { class: 'rt-user' }, [
+          h('div', { class: 'rt-nick', text: nick || '(未知昵称)' }),
+          h('div', { class: 'rt-uid' }, [
+            h('span', { text: 'UID ' + uid }),
+            h('a', { class: 'rt-link', href: 'https://space.bilibili.com/' + uid, target: '_blank', rel: 'noreferrer', text: '空间' }),
+            u ? h('span', { class: 'rt-dim', text: '· 已记录 ' + (u.items || []).length + ' 条' }) : null,
+          ]),
+        ]),
+        ctxBox,
+        h('div', { class: 'rt-sec-title', text: '该用户的标记' }),
+        tagBox,
+        h('div', { class: 'rt-input-row' }, [
+          h('div', { class: 'rt-input-wrap' }, [input, drop]),
+          h('button', { class: 'rt-btn rt-btn--primary', onclick: doAdd, text: '添加' }),
+        ]),
+        h('div', { class: 'rt-sec-title', text: '留痕记录' }),
+        itemBox,
+        h('div', { class: 'rt-actions' }, [
+          h('button', {
+            class: 'rt-btn',
+            text: '复制信息',
+            onclick: () => {
+              const cur = store.users[uid] || { tags: [], items: [] };
+              const txt = ['昵称：' + (cur.nickname || nick), 'UID：' + uid, '标记：' + (cur.tags || []).join('、')]
+                .concat((cur.items || []).slice(0, 5).map((it) => (it.type === 'video' ? '[视频] ' : '[评论] ') + ((it.tags || []).join('、')) + ' | ' + (it.title || it.content || '') + (it.bv ? ' | ' + it.bv : '')))
+                .join('\n');
+              copyText(txt);
+            },
+          }),
+          h('button', { class: 'rt-btn rt-btn--danger', text: '删除该用户', onclick: () => { removeUser(uid); closePanel(); toast('已删除该用户'); } }),
+        ]),
+      ]),
     ]);
 
-    document.body.appendChild(panel);
-    placePanel(panel, a);
+    document.documentElement.appendChild(panel);
+    placePanel(panel, rec);
     refreshTags();
     renderItems();
     setTimeout(() => { try { input.focus(); } catch (e) { /* 忽略 */ } }, 30);
   }
 
-  function placePanel(p, anchor) {
+  function placePanel(p, rec) {
     p.style.visibility = 'hidden';
     const w = p.offsetWidth || 360;
     const hh = p.offsetHeight || 400;
     let left = 12, top = 12;
     try {
-      const r = anchor.getBoundingClientRect();
+      const r = rec.a.getBoundingClientRect();
       left = Math.min(Math.max(8, r.left), Math.max(8, window.innerWidth - w - 12));
       top = r.bottom + 6;
       if (top + hh > window.innerHeight - 8) top = Math.max(8, window.innerHeight - hh - 12);
@@ -722,28 +866,34 @@
       while (listBox.firstChild) listBox.removeChild(listBox.firstChild);
       listBox.appendChild(h('div', { class: 'rt-dim', text: '共 ' + arr.length + ' 位用户 / 命中 ' + filtered.length + ' 位' }));
       filtered.slice(0, 200).forEach((u) => {
+        const delUser = h('span', { class: 'rt-mgr-x', title: '删除该用户', text: '删除' });
+        delUser.addEventListener('click', () => { removeUser(u.uid); renderList(); });
+        const head = h('div', { class: 'rt-mgr-hd' }, [
+          h('a', { class: 'rt-link rt-nick', href: 'https://space.bilibili.com/' + u.uid, target: '_blank', rel: 'noreferrer', text: u.nickname || '(未知)' }),
+          h('span', { class: 'rt-dim', text: 'UID ' + u.uid }),
+          h('span', { class: 'rt-dim', text: '留痕 ' + (u.items || []).length + ' 条' }),
+          delUser,
+        ]);
+
+        const tagNodes = (u.tags || []).map((t) => {
+          const x = h('span', { class: 'rt-tag-x', title: '删除标记', text: '×' });
+          x.addEventListener('click', () => { removeTag(u.uid, t); renderList(); });
+          return h('span', { class: 'rt-tag' }, [h('span', { class: 'rt-tag-t', text: t }), x]);
+        });
+
+        const addTag = h('span', { class: 'rt-mini-tag rt-mini-tag--add', title: '添加标记', text: '＋' });
+        addTag.addEventListener('click', () => {
+          const v = window.prompt('为该用户添加标记（多个用逗号分隔）', '');
+          if (v && v.trim()) {
+            addMark(u.uid, u.nickname, { type: 'manual', bv: '', title: '', videoTime: '', content: '', url: location.href }, v.trim());
+            renderList();
+          }
+        });
+        tagNodes.push(addTag);
+
         listBox.appendChild(h('div', { class: 'rt-mgr-item' }, [
-          h('div', { class: 'rt-mgr-hd' }, [
-            h('a', { class: 'rt-link rt-nick', href: 'https://space.bilibili.com/' + u.uid, target: '_blank', rel: 'noreferrer', text: u.nickname || '(未知)' }),
-            h('span', { class: 'rt-dim', text: 'UID ' + u.uid }),
-            h('span', { class: 'rt-dim', text: '留痕 ' + (u.items || []).length + ' 条' }),
-            h('span', { class: 'rt-mgr-x', title: '删除该用户', onclick: () => { removeUser(u.uid); renderList(); }, text: '删除' }),
-          ]),
-          h('div', { class: 'rt-mgr-tags' }, (u.tags || []).map((t) => h('span', { class: 'rt-tag' }, [
-            h('span', { class: 'rt-tag-t', text: t }),
-            h('span', { class: 'rt-tag-x', title: '删除标记', onclick: () => { removeTag(u.uid, t); renderList(); }, text: '×' }),
-          ])).concat([h('span', {
-            class: 'rt-mini-tag rt-mini-tag--add',
-            title: '添加标记',
-            text: '＋',
-            onclick: () => {
-              const v = window.prompt('为该用户添加标记（多个用逗号分隔）', '');
-              if (v && v.trim()) {
-                addMark(u.uid, u.nickname, { type: 'manual', bv: '', title: '', videoTime: '', content: '', url: location.href }, v.trim());
-                renderList();
-              }
-            },
-          })])),
+          head,
+          h('div', { class: 'rt-mgr-tags' }, tagNodes),
         ]));
       });
     };
@@ -753,28 +903,7 @@
       const f = fileInput.files && fileInput.files[0];
       if (!f) return;
       const fr = new FileReader();
-      fr.onload = () => {
-        try {
-          const o = JSON.parse(String(fr.result));
-          const incoming = (o && o.users) || o;
-          let n = 0;
-          Object.keys(incoming).forEach((uid) => {
-            const src = incoming[uid];
-            if (!src || !uid) return;
-            const dst = store.users[uid] || { uid: uid, nickname: src.nickname || '', tags: [], items: [], createdAt: Date.now() };
-            dst.nickname = src.nickname || dst.nickname;
-            dst.tags = unionArr(dst.tags || [], src.tags || []);
-            dst.items = (src.items || []).concat(dst.items || []).slice(0, MAX_ITEMS_PER_USER);
-            dst.updatedAt = Date.now();
-            store.users[uid] = dst;
-            n++;
-          });
-          store.tagLib = unionArr(store.tagLib || [], (o && o.tagLib) || []);
-          saveStore();
-          renderList();
-          toast('已导入 ' + n + ' 位用户');
-        } catch (e) { toast('导入失败：文件不是合法 JSON'); }
-      };
+      fr.onload = () => { importJSON(String(fr.result), renderList); };
       fr.readAsText(f);
       fileInput.value = '';
     });
@@ -789,11 +918,8 @@
         h('div', { class: 'rt-actions' }, [
           h('button', { class: 'rt-btn', text: '导出 JSON', onclick: exportJSON }),
           h('button', { class: 'rt-btn', text: '导入 JSON', onclick: () => fileInput.click() }),
-          h('button', {
-            class: 'rt-btn',
-            text: store.settings.stealth ? '隐身模式：开' : '隐身模式：关',
-            onclick: (ev) => { toggleStealth(); ev.target.textContent = store.settings.stealth ? '隐身模式：开' : '隐身模式：关'; },
-          }),
+          h('button', { class: 'rt-btn', id: 'rt-btn-stealth', text: store.settings.stealth ? '隐身模式：开' : '隐身模式：关', onclick: (ev) => { toggleStealth(); ev.target.textContent = store.settings.stealth ? '隐身模式：开' : '隐身模式：关'; } }),
+          h('button', { class: 'rt-btn', id: 'rt-btn-enable', text: store.settings.enabled ? '页面渲染：开' : '页面渲染：关', onclick: (ev) => { toggleEnabled(); ev.target.textContent = store.settings.enabled ? '页面渲染：开' : '页面渲染：关'; } }),
           h('button', {
             class: 'rt-btn rt-btn--danger',
             text: '清空全部',
@@ -807,18 +933,44 @@
             },
           }),
         ]),
+        h('div', { class: 'rt-dim', text: '隐身模式：隐藏页面上全部标记（照常记录）。页面渲染：完全停止浮层，用于排查页面异常。' }),
         listBox,
         fileInput,
       ]),
     ]);
 
     search.addEventListener('input', renderList);
-    document.body.appendChild(mgr);
+    document.documentElement.appendChild(mgr);
     const w = 520, hh = Math.min(600, window.innerHeight - 80);
     mgr.style.left = Math.max(8, (window.innerWidth - w) / 2) + 'px';
     mgr.style.top = Math.max(8, (window.innerHeight - hh) / 2) + 'px';
     mgr.style.maxHeight = hh + 'px';
     renderList();
+  }
+
+  function importJSON(text, done) {
+    try {
+      const o = JSON.parse(text);
+      const incoming = (o && o.users) || o;
+      let n = 0;
+      Object.keys(incoming).forEach((uid) => {
+        const src = incoming[uid];
+        if (!src || !uid) return;
+        const dst = store.users[uid] || { uid: uid, nickname: src.nickname || '', tags: [], items: [], createdAt: Date.now() };
+        dst.nickname = src.nickname || dst.nickname;
+        dst.tags = unionArr(dst.tags || [], src.tags || []);
+        dst.items = (src.items || []).concat(dst.items || []).slice(0, MAX_ITEMS_PER_USER);
+        dst.updatedAt = Date.now();
+        store.users[uid] = dst;
+        n++;
+      });
+      store.tagLib = unionArr(store.tagLib || [], (o && o.tagLib) || []);
+      saveStore();
+      if (done) done();
+      toast('已导入 ' + n + ' 位用户');
+    } catch (e) {
+      toast('导入失败：文件不是合法 JSON');
+    }
   }
 
   function unionArr(a, b) {
@@ -832,8 +984,8 @@
       const raw = JSON.stringify(store, null, 2);
       const blob = new Blob([raw], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
-      const a = h('a', { href: url, download: 'bili-user-marker-' + new Date().toISOString().slice(0, 10) + '.json' });
-      document.body.appendChild(a);
+      const a = h('a', { href: url, download: 'replicant-tag-' + new Date().toISOString().slice(0, 10) + '.json' });
+      document.documentElement.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 5000);
@@ -841,65 +993,40 @@
     } catch (e) { toast('导出失败'); }
   }
 
-  /* ====================== 隐身模式 ====================== */
+  /* ====================== 隐身 / 暂停 ====================== */
 
   function applyStealth() {
-    try { document.body.classList.toggle('rt-stealth', !!store.settings.stealth); } catch (e) { /* 忽略 */ }
+    if (overlay) overlay.style.display = (!store.settings.enabled || store.settings.stealth) ? 'none' : '';
   }
 
   function toggleStealth() {
     store.settings.stealth = !store.settings.stealth;
     saveStore();
     applyStealth();
-    toast(store.settings.stealth ? '隐身模式：已开启（页面不再显示标记与入口）' : '隐身模式：已关闭');
+    toast(store.settings.stealth ? '隐身模式：已开启（页面不再显示标记）' : '隐身模式：已关闭');
   }
 
-  /* ====================== 扫描循环 ====================== */
-
-  let scheduled = false;
-  function scheduleScan(immediate) {
-    if (immediate) { doScan(); return; }
-    if (scheduled) return;
-    scheduled = true;
-    setTimeout(() => { scheduled = false; doScan(); }, 400);
-  }
-
-  function doScan() {
-    if (!document.body) return;
-    // 清理失效记录
-    for (let i = slotRecords.length - 1; i >= 0; i--) {
-      if (!slotRecords[i].slot.isConnected) slotRecords.splice(i, 1);
-    }
-    let links;
-    try {
-      const roots = collectRoots();
-      links = [];
-      for (const r of roots) {
-        try { r.querySelectorAll(LINK_SEL).forEach((a) => links.push(a)); } catch (e) { /* 忽略 */ }
-      }
-    } catch (e) { return; }
-
-    for (const a of links) {
-      if (a.closest && a.closest('.rt-slot, .rt-panel')) continue;
-      try { ensureSlot(a); } catch (e) { /* 单条失败不影响整体 */ }
-    }
-    // 数据变更后刷新展示
-    for (const rec of slotRecords) {
-      if (rec.rev !== storeRev) { renderSlot(rec.a); rec.rev = storeRev; }
-    }
+  function toggleEnabled() {
+    store.settings.enabled = !store.settings.enabled;
+    saveStore();
+    applyStealth();
+    if (store.settings.enabled) scan();
+    toast(store.settings.enabled ? '页面渲染：已开启' : '页面渲染：已关闭（数据仍可管理）');
   }
 
   /* ====================== 样式 ====================== */
 
   function injectStyle() {
     const css = [
-      '.rt-slot{display:inline-flex;align-items:center;gap:4px;vertical-align:middle;margin:0 4px;max-width:100%;flex-wrap:wrap;font-family:inherit!important}',
-      '.rt-chip{display:inline-flex;align-items:center;max-width:120px;height:18px;padding:0 7px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;line-height:18px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none;box-sizing:border-box}',
-      '.rt-chip:hover{filter:brightness(1.08)}',
-      '.rt-btn-mini{display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:9px;background:rgba(251,114,153,.12);color:#fb7299!important;font-size:12px;line-height:18px;cursor:pointer;user-select:none;opacity:.75}',
-      '.rt-btn-mini:hover{opacity:1}',
-      '.rt-btn-mini--ghost{background:transparent;color:#999!important;padding:0 3px}',
-      '.rt-panel{position:fixed;z-index:2147483000;width:360px;max-height:72vh;overflow:auto;background:#fff;color:#222;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.28);font-size:13px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.5}',
+      '#rt-overlay{position:fixed;left:0;top:0;width:0;height:0;overflow:visible;z-index:2147483000;pointer-events:none}',
+      '.rt-box{position:absolute;left:0;top:0;display:inline-flex;align-items:center;gap:4px;pointer-events:auto;opacity:.55;transition:opacity .15s;white-space:nowrap;overflow:hidden;font-family:inherit!important;line-height:1.2}',
+      '.rt-box:hover{opacity:1}',
+      '.rt-chip{display:inline-flex;align-items:center;min-width:0;max-width:120px;height:18px;padding:0 7px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;line-height:18px;overflow:hidden;text-overflow:ellipsis;cursor:pointer;user-select:none;box-sizing:border-box;box-shadow:0 1px 4px rgba(0,0,0,.25)}',
+      '.rt-chip:hover{filter:brightness(1.1)}',
+      '.rt-chip--more{background:#8a8a8a}',
+      '.rt-mini{display:inline-flex;align-items:center;height:18px;padding:0 6px;border-radius:9px;background:#fb7299;color:#fff!important;font-size:12px;line-height:18px;cursor:pointer;user-select:none;box-shadow:0 1px 4px rgba(0,0,0,.25)}',
+      '.rt-mini--add{background:rgba(255,255,255,.92);color:#fb7299!important;border:1px solid #fb7299}',
+      '.rt-panel{position:fixed;z-index:2147483100;width:360px;max-height:72vh;overflow:auto;background:#fff;color:#222;border-radius:10px;box-shadow:0 8px 30px rgba(0,0,0,.28);font-size:13px;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;line-height:1.5}',
       '.rt-panel--mgr{width:520px}',
       '.rt-panel-hd{position:sticky;top:0;display:flex;align-items:center;justify-content:space-between;padding:10px 12px;background:#fb7299;color:#fff;font-weight:600;border-radius:10px 10px 0 0}',
       '.rt-x{cursor:pointer;font-size:18px;line-height:1;padding:0 4px}',
@@ -953,9 +1080,8 @@
       '.rt-mgr-item{border:1px solid #f0f0f0;border-radius:8px;padding:8px 10px;margin-bottom:8px}',
       '.rt-mgr-hd{display:flex;flex-wrap:wrap;gap:8px;align-items:center}',
       '.rt-mgr-x{margin-left:auto;color:#c00;cursor:pointer;font-size:12px}',
-      '.rt-toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);background:rgba(0,0,0,.8);color:#fff;padding:8px 14px;border-radius:18px;font-size:13px;z-index:2147483100;opacity:0;transition:.2s;pointer-events:none}',
+      '.rt-toast{position:fixed;left:50%;bottom:40px;transform:translateX(-50%) translateY(20px);background:rgba(0,0,0,.8);color:#fff;padding:8px 14px;border-radius:18px;font-size:13px;z-index:2147483200;opacity:0;transition:.2s;pointer-events:none}',
       '.rt-toast.show{opacity:1;transform:translateX(-50%) translateY(0)}',
-      '.rt-stealth .rt-slot,.rt-stealth .rt-chip,.rt-stealth .rt-btn-mini{display:none!important}',
     ].join('\n');
     try { GM_addStyle(css); } catch (e) {
       const s = document.createElement('style');
@@ -968,7 +1094,7 @@
     let t = document.getElementById('rt-toast');
     if (!t) {
       t = h('div', { id: 'rt-toast', class: 'rt-toast' });
-      document.body.appendChild(t);
+      (document.documentElement || document.body).appendChild(t);
     }
     t.textContent = msg;
     t.classList.add('show');
@@ -980,23 +1106,36 @@
 
   function init() {
     injectStyle();
+    ensureOverlay();
     applyStealth();
-    doScan();
-    setInterval(doScan, 2000);
+    scan();
+
+    // 页面结构变化 -> 防抖重扫（只读取，不写入页面 DOM）
     try {
       new MutationObserver(() => scheduleScan()).observe(document.body, { childList: true, subtree: true });
     } catch (e) { /* 忽略 */ }
+
+    // 位置跟随滚动 / 缩放
+    window.addEventListener('scroll', requestLayout, true);
+    window.addEventListener('resize', requestLayout);
+    document.addEventListener('scroll', requestLayout, true);
+
+    // 定时兜底：应对纯 CSS 布局变化与懒加载
+    setInterval(() => { scan(); }, 3000);
+
     window.addEventListener('keydown', (e) => {
       if (e.altKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) { e.preventDefault(); toggleStealth(); }
       if (e.key === 'Escape') closePanel();
     });
     document.addEventListener('click', (e) => {
-      if (panel && !panel.contains(e.target) && !(panelAnchor && panelAnchor.contains(e.target))) closePanel();
+      if (panel && !panel.contains(e.target) && !(overlay && overlay.contains(e.target))) closePanel();
     }, true);
 
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('打开标记管理面板', openManager);
       GM_registerMenuCommand('切换隐身模式（Alt+Shift+M）', toggleStealth);
+      GM_registerMenuCommand('开启/关闭页面渲染（排查用）', toggleEnabled);
+      GM_registerMenuCommand('立即重新定位标记', () => { scan(); toast('已重新定位'); });
       GM_registerMenuCommand('导出标记数据（JSON）', exportJSON);
       GM_registerMenuCommand('导入标记数据（JSON）', () => {
         const inp = h('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
@@ -1004,27 +1143,10 @@
           const f = inp.files && inp.files[0];
           if (!f) return;
           const fr = new FileReader();
-          fr.onload = () => {
-            try {
-              const o = JSON.parse(String(fr.result));
-              const incoming = (o && o.users) || o;
-              Object.keys(incoming).forEach((uid) => {
-                const src = incoming[uid];
-                if (!src || !uid) return;
-                const dst = store.users[uid] || { uid: uid, nickname: src.nickname || '', tags: [], items: [], createdAt: Date.now() };
-                dst.nickname = src.nickname || dst.nickname;
-                dst.tags = unionArr(dst.tags || [], src.tags || []);
-                dst.items = (src.items || []).concat(dst.items || []).slice(0, MAX_ITEMS_PER_USER);
-                store.users[uid] = dst;
-              });
-              store.tagLib = unionArr(store.tagLib || [], (o && o.tagLib) || []);
-              saveStore();
-              toast('已导入');
-            } catch (err) { toast('导入失败'); }
-          };
+          fr.onload = () => importJSON(String(fr.result));
           fr.readAsText(f);
         });
-        document.body.appendChild(inp);
+        document.documentElement.appendChild(inp);
         inp.click();
         setTimeout(() => inp.remove(), 3000);
       });
@@ -1036,4 +1158,7 @@
   } else {
     init();
   }
+
+  // 供测试使用
+  window.__rt = { computePos: computePos, targets: targets, store: () => store };
 })();
