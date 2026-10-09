@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.1.0
+// @version      1.1.1
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区等级右侧、视频卡片标题下方、播放页UP面板左侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。目前支持B站，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -258,22 +258,38 @@
   }
 
   // 取文本（包含 Shadow DOM 内的文本）
+  // 这些标签里的内容不是正文：B站组件的 shadow DOM 常内嵌 <style>（含 --bili-* 变量），
+  // 早期版本会把这些 CSS 当成评论正文抓进来。
+  const SKIP_TAGS = { STYLE: 1, SCRIPT: 1, NOSCRIPT: 1, TEMPLATE: 1, LINK: 1, META: 1, HEAD: 1, TITLE: 1, SVG: 1, PATH: 1 };
+
+  function cleanText(s) {
+    let t = String(s || '').replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+    // 兜底：万一仍有 B站内部 CSS 变量混进来，剔除之
+    if (/--bili-[a-z0-9-]+\s*:/i.test(t)) {
+      t = t.replace(/--bili-[a-z0-9-]+\s*:[^;}]*[;}]?/gi, ' ').replace(/\s+/g, ' ').trim();
+    }
+    return t;
+  }
+
   function textOf(el) {
     if (!el) return '';
     let out = '';
     const walk = (n, lv) => {
-      if (lv > 6) return;
+      if (lv > 8) return;
       for (const c of n.childNodes) {
-        if (c.nodeType === 3) out += c.nodeValue;
-        else if (c.nodeType === 1) {
-          if (c.shadowRoot) walk(c.shadowRoot, lv + 1);
-          walk(c, lv + 1);
-        }
+        if (c.nodeType === 3) { out += c.nodeValue; continue; }
+        if (c.nodeType !== 1) continue;
+        if (SKIP_TAGS[c.tagName]) continue;
+        if (c.hasAttribute && c.hasAttribute('hidden')) continue;
+        if (c.getAttribute && c.getAttribute('aria-hidden') === 'true') continue;
+        if (c.shadowRoot) walk(c.shadowRoot, lv + 1);
+        walk(c, lv + 1);
       }
     };
     if (el.shadowRoot) walk(el.shadowRoot, 0);
     walk(el, 0);
-    return out.replace(/\s+/g, ' ').trim();
+    return cleanText(out);
   }
 
   function uidFromHref(href) {
@@ -358,19 +374,101 @@
     return a;
   }
 
+  // 有效可视矩形：B站常把同一个用户的头像链接与昵称链接并存，需要据此去重
+  function rectOf(el) {
+    if (!el) return null;
+    try {
+      const r = el.getBoundingClientRect();
+      if (!r) return null;
+      if (!r.width && !r.height) return null;
+      return r;
+    } catch (e) { return null; }
+  }
+
+  function isAvatarLink(a) {
+    if (!a) return false;
+    const cls = String(a.className || '');
+    if (/avatar|face|bili-avatar/i.test(cls)) return true;
+    try { if (a.querySelector('img, svg')) return true; } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  function rectNear(a, b) {
+    if (!a || !b) return false;
+    const ox = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    const oy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+    // 直接重叠，或紧挨着（同一行内的头像与昵称）
+    if (ox > -60 && oy > -40) return true;
+    const cx1 = (a.left + a.right) / 2, cy1 = (a.top + a.bottom) / 2;
+    const cx2 = (b.left + b.right) / 2, cy2 = (b.top + b.bottom) / 2;
+    return Math.abs(cx1 - cx2) < 90 && Math.abs(cy1 - cy2) < 70;
+  }
+
+  // 同一位置多个候选时选最优锚点：有昵称 > 非头像链接 > 有矩形
+  function anchorScore(c) {
+    let s = 0;
+    if (c.nick) s += 8;
+    if (!c.isAvatar) s += 4;
+    if (c.rect) s += 2;
+    if (c.rect) s += Math.min(c.rect.width, 400) / 2000;
+    return s;
+  }
+
+  // 同一 uid 下做空间聚类，一处只保留一个锚点
+  function dedupeAnchors(cands) {
+    const groups = [];
+    for (const c of cands) {
+      let g = null;
+      for (const gg of groups) {
+        if (c.host && gg.host === c.host) { g = gg; break; }
+        if (rectNear(gg.rect, c.rect)) { g = gg; break; }
+      }
+      if (!g) { g = { host: c.host, rect: c.rect, items: [] }; groups.push(g); }
+      g.items.push(c);
+    }
+    const out = [];
+    for (const g of groups) {
+      let best = null;
+      for (const it of g.items) {
+        if (!best || anchorScore(it) > anchorScore(best)) best = it;
+      }
+      out.push(best);
+    }
+    return out;
+  }
+
   function findCardTitle(host) {
     const root = host && (host.shadowRoot || host);
     if (!root) return null;
     return deepFindFirst(root, CARD_TITLE_SEL);
   }
 
+  // bili-rich-text 的正文在其 light DOM（<span>/<p>），shadow DOM 里只有 <style>，
+  // 因此优先读 light DOM，读不到再退到 shadow。
+  function bodyText(el) {
+    if (!el) return '';
+    let s = '';
+    try {
+      const clone = el.cloneNode(true);
+      const styles = clone.querySelectorAll ? clone.querySelectorAll('style,script,template') : [];
+      for (const st of styles) st.remove();
+      s = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+    } catch (e) { s = ''; }
+    if (!s) s = textOf(el);
+    return cleanText(s);
+  }
+
   function buildCtx(rec) {
     const host = rec.host;
     if (rec.scene === 'comment') {
-      const body = deepFindFirst(host && (host.shadowRoot || host), ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '[class*="content"]']);
+      const root = host && (host.shadowRoot || host);
+      const body = deepFindFirst(root, ['bili-rich-text', '.reply-content', '.root-reply', '.comment-content', '[class*="reply-content"]', '.reply-content-container', '.content']);
+      let content = bodyText(body);
+      if (!content && body) content = textOf(body);
+      if (!content) content = textOf(host);
       return {
         type: 'comment',
-        content: (body ? textOf(body) : textOf(host)).slice(0, 500),
+        content: content.slice(0, 500),
         bv: currentBV(),
         title: currentTitle(),
         videoTime: currentPubDate(),
@@ -584,22 +682,54 @@
       }
     });
 
-    const seen = new Set();
+    // 1) 收集候选
+    const cands = [];
     forEachRoot((root) => {
       let as;
       try { as = root.querySelectorAll(LINK_SEL); } catch (e) { return; }
       for (const a of as) {
-        if (targets.has(a)) { seen.add(a); continue; }
-        if (seen.has(a)) continue;
         const uid = uidFromHref(hrefOf(a));
         if (!uid) continue;
         const c = classify(a);
         if (!c) continue;
-        const nick = (textOf(a) || a.getAttribute('title') || '').slice(0, 60);
-        targets.set(a, { a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, box: null, rev: -1 });
-        seen.add(a);
+        const rect = rectOf(a);
+        // 完全不可见（无尺寸）的链接跳过：多为隐藏的重复节点
+        if (!rect) continue;
+        const nick = (textOf(a) || a.getAttribute('title') || '').replace(/^@/, '').trim().slice(0, 60);
+        cands.push({ a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, rect: rect, isAvatar: isAvatarLink(a) });
       }
     });
+
+    // 2) 昵称回填：头像链接没有文字，用同 UID 的昵称链接补齐
+    const nickMap = new Map();
+    for (const c of cands) {
+      if (!c.nick) continue;
+      const cur = nickMap.get(c.uid);
+      if (!cur || c.nick.length > cur.length) nickMap.set(c.uid, c.nick);
+    }
+    for (const c of cands) if (!c.nick && nickMap.has(c.uid)) c.nick = nickMap.get(c.uid);
+
+    // 3) 同一 UID 按空间去重：一处只留一个锚点
+    const byUid = new Map();
+    for (const c of cands) {
+      if (!byUid.has(c.uid)) byUid.set(c.uid, []);
+      byUid.get(c.uid).push(c);
+    }
+    const kept = [];
+    byUid.forEach((list) => { kept.push.apply(kept, dedupeAnchors(list)); });
+
+    // 4) 写入 targets
+    const seen = new Set();
+    for (const c of kept) {
+      seen.add(c.a);
+      const old = targets.get(c.a);
+      if (old) {
+        // 已存在：只更新可能变化的信息，保留 box
+        old.uid = c.uid; old.nick = c.nick; old.scene = c.scene; old.host = c.host;
+        continue;
+      }
+      targets.set(c.a, { a: c.a, uid: c.uid, nick: c.nick, scene: c.scene, host: c.host, box: null, rev: -1 });
+    }
 
     const missing = [];
     targets.forEach((rec, a) => { if (!seen.has(a)) missing.push(a); });
