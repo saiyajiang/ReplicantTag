@@ -1,8 +1,10 @@
 # ReplicantTag · 用户标记器
 
+[![GreasyFork 安装](https://img.shields.io/badge/GreasyFork-安装-e4572e?logo=greasyfork)](https://greasyfork.org/zh-CN/scripts/599393) [![GitHub](https://img.shields.io/badge/GitHub-源码-181717?logo=github)](https://github.com/saiyajiang/ReplicantTag) ![License](https://img.shields.io/badge/license-MIT-green)
+
 给**视频或评论对应的用户**打标记：自动记录昵称与 UID，并把当时的上下文一并留痕。标记可下拉复用，一个用户可有多个标记，标记直接显示在页面上，支持隐身模式与 JSON 备份。
 
-> 本脚本**由 AI 编写**。
+> 本脚本**由 AI 编写**，作者 [saiyajiang](https://github.com/saiyajiang)。
 
 当前支持站点：**哔哩哔哩（bilibili.com）**。架构按多站点预留，后续将扩展至更多站点。
 
@@ -59,11 +61,17 @@
 
 ## 安装
 
+**方式一：GreasyFork（推荐，可自动更新）**
+
+→ https://greasyfork.org/zh-CN/scripts/599393
+
+**方式二：从本仓库安装**
+
 1. 安装油猴扩展：[Tampermonkey](https://www.tampermonkey.net/) / [Violentmonkey](https://violentmonkey.github.io/)
-2. 打开 [`ReplicantTag.user.js`](./ReplicantTag.user.js)，点击「安装」（或把文件内容粘贴进油猴新建脚本）
+2. 打开 [ReplicantTag.user.js 原始文件](https://raw.githubusercontent.com/saiyajiang/ReplicantTag/main/ReplicantTag.user.js)，点击「安装」（或把文件内容粘贴进油猴新建脚本）
 3. 打开任意 B 站页面即可生效
 
-脚本头部为 GreasyFork 兼容格式，可直接用于 GreasyFork 提交。
+脚本头部为 GreasyFork 兼容格式，可直接在 GreasyFork 提交更新。
 
 ---
 
