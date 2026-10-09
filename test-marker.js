@@ -25,6 +25,7 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
 {
   const html = `<!doctype html><html><head><title>测试视频标题 - 哔哩哔哩</title></head><body>
   <div class="video-info"><h1 class="video-title">测试视频标题</h1><span class="pubdate-ip">2024-05-01 10:00</span></div>
+  <bili-comment id="c0"></bili-comment>
   <bili-comment id="c1"></bili-comment>
   <bili-comment id="c2"></bili-comment>
   <bili-video-card id="v1"></bili-video-card>
@@ -36,6 +37,20 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   const dom = new JSDOM(html, { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', pretendToBeVisual: true, runScripts: 'outside-only' });
   const { window } = dom; const doc = window.document;
   const { mem, menus } = stubGM(window);
+
+  // 评论 0：正文整个渲染在 shadow DOM 里且与 <style> 混排（B站 bili-rich-text 真实形态）
+  const c0 = doc.getElementById('c0');
+  const csr0 = c0.attachShadow({ mode: 'open' });
+  csr0.innerHTML = `<div class="comment-wrap">
+    <div class="user-info"><a href="//space.bilibili.com/777" class="user-name">老戴</a><span class="level">Lv6</span></div>
+    <bili-rich-text class="rt"></bili-rich-text>
+  </div>`;
+  const rich0 = csr0.querySelector('bili-rich-text');
+  const rsr = rich0.attachShadow({ mode: 'open' });
+  rsr.innerHTML = `<style>:host{--bili-rich-text-display: block;color: inherit;font-size:15px}.x{display:none}</style><div class="c"><span>热评通知书(=·ω·=)</span></div>`;
+  rect(csr0.querySelector('.user-name'), 160, 100, 90, 16);
+  rect(csr0.querySelector('.level'), 255, 100, 30, 16);
+  rect(c0, 90, 90, 900, 120);
 
   // 评论 1：头像链接 + 昵称链接 + 内嵌 style 的正文（B站真实结构：bili-avatar 是独立组件）
   const c1 = doc.getElementById('c1');
@@ -96,9 +111,10 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   console.log('--- 场景 A：视频页 ---');
   // 修复 2：头像链接 + 昵称链接只出一个 +标
   const cmtRecs = recs().filter((r) => r.scene === 'comment');
-  assert(cmtRecs.length === 2, '两条评论共 2 个锚点（头像与昵称已合并），实际 ' + cmtRecs.length);
+  assert(cmtRecs.length === 3, '三条评论共 3 个锚点（头像与昵称已合并），实际 ' + cmtRecs.length);
   assert(cmtRecs.every((r) => r.a.className === 'user-name'), '保留的是昵称链接，头像链接被丢弃');
-  assert(cmtRecs.every((r) => r.nick === '张三'), '昵称正确');
+  assert(cmtRecs.every((r) => r.nick && !/^\s*$/.test(r.nick)), '每个锚点都有昵称');
+  assert(cmtRecs.filter((r) => r.uid === '123456').length === 2 && cmtRecs.filter((r) => r.uid === '123456').every((r) => r.nick === '张三'), '同一用户两条评论各自保留昵称正确');
   assert(rt.isAvatarLink(av1) === true, '头像链接被识别为 avatar（含 bili-avatar 祖先）');
   assert(rt.isAvatarLink(name1) === false, '昵称链接不被识别为 avatar');
 
@@ -142,9 +158,77 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(/这是一条测试评论内容/.test(ctxText), '正文抓取到真实评论内容');
   assert(!/--bili-rich-text-display/.test(ctxText), '正文不含 B站 CSS 变量');
 
+  // 修复 2：正文在 shadow DOM 里与 <style> 混排的情况
+  const cmt0 = recs().filter((r) => r.scene === 'comment' && r.uid === '777')[0];
+  assert(!!cmt0, '识别出 shadow 正文评论的锚点');
+  const c0Text = rt.commentContent(cmt0.host);
+  assert(/热评通知书/.test(c0Text), 'shadow DOM 正文被正确提取: ' + JSON.stringify(c0Text.slice(0, 40)));
+  assert(!/--bili-rich-text-display/.test(c0Text), 'shadow 场景不含 CSS 变量');
+  assert(!/display:/.test(c0Text) && !/font-size/.test(c0Text), 'shadow 场景不含 CSS 声明');
+  assert(!/\{/.test(c0Text), 'shadow 场景不含花括号');
+  const sPure = rt.sanitizeContent(':host{--bili-rich-text-display: block;color: inherit}');
+  assert(sPure === '', '纯 CSS 被清洗为空串: ' + JSON.stringify(sPure));
+  const sMix = rt.sanitizeContent('热评通知书(=·ω·=)');
+  assert(sMix === '热评通知书(=·ω·=)', '正常文本不被误清洗');
+  assert(rt.looksLikeCSS('--bili-rich-text-display: block;') === true, 'CSS 被正确识别');
+  assert(rt.looksLikeCSS('哦那可太糟糕了') === false, '中文评论不被误判为 CSS');
+
+  // 留痕记录渲染时也做清洗（覆盖历史脏数据）
+  cmt0.box.querySelector('.rt-mini').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const panel0 = doc.querySelector('.rt-panel');
+  panel0.querySelector('.rt-input').value = 'shadow测试';
+  Array.from(panel0.querySelectorAll('.rt-btn')).find((b) => b.textContent === '添加').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const s0 = JSON.parse(mem['ReplicantTag_store_v1']);
+  const item0 = s0.users['777'].items[0];
+  assert(/热评通知书/.test(item0.content), '存储的内容是真实评论');
+  assert(!/--bili/.test(item0.content), '存储的内容不含 CSS');
+
+  // 修复 1：面板可拖拽
+  const hd = panel.querySelector('.rt-panel-hd');
+  assert(!!hd, '面板有标题栏');
+  const cssAll = Array.from(doc.head.querySelectorAll('style')).map((s2) => s2.textContent).join('');
+  assert(/\.rt-panel-hd\{[^}]*cursor:move/.test(cssAll), '标题栏带 cursor:move（可拖拽）');
+  const posBefore = { left: parseFloat(panel.style.left) || 0, top: parseFloat(panel.style.top) || 0 };
+  // jsdom 默认 rect 全 0，这里补一个真实位置，才能验证「按位移量」拖拽
+  panel.getBoundingClientRect = () => ({ x: posBefore.left, y: posBefore.top, left: posBefore.left, top: posBefore.top, right: posBefore.left + 360, bottom: posBefore.top + 400, width: 360, height: 400, toJSON() { return this; } });
+  hd.dispatchEvent(new window.MouseEvent('mousedown', { bubbles: true, clientX: 100, clientY: 50, button: 0 }));
+  doc.dispatchEvent(new window.MouseEvent('mousemove', { bubbles: true, clientX: 180, clientY: 130 }));
+  doc.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true, clientX: 180, clientY: 130 }));
+  const posAfter = { left: parseFloat(panel.style.left) || 0, top: parseFloat(panel.style.top) || 0 };
+  assert(posAfter.left === posBefore.left + 80, '面板跟随鼠标水平移动: ' + posBefore.left + ' -> ' + posAfter.left);
+  assert(posAfter.top === posBefore.top + 80, '面板跟随鼠标垂直移动: ' + posBefore.top + ' -> ' + posAfter.top);
+
+  // 修复 3：UP 标记不再截断 / 不再遮挡昵称简介
+  // 3a 左侧空白够宽：完整显示，不设限宽
+  const upWide = rt.computePos('up', {
+    main: { left: 100, top: 700, right: 900, bottom: 780, width: 800, height: 80 },
+    guard: { left: 260, top: 705, right: 308, bottom: 753, width: 48, height: 48 },
+    text: { left: 320, top: 710, right: 700, bottom: 770, width: 380, height: 60 },
+  }, 120, 18, 1440);
+  assert(upWide.left === 102, 'UP 左侧空间足够时放在红框位置: left=' + upWide.left);
+  assert(!upWide.maxW, '不再因空间不足而截断（无限宽）: maxW=' + upWide.maxW);
+  assert(upWide.left + 120 <= 260, '未越过头像左边界');
+  // 3b 左侧空白窄（此前会被压成 28px 半截）：改放头像/文字块右侧
+  const upTight = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 1000, bottom: 780, width: 700, height: 80 },
+    guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
+    text: { left: 360, top: 710, right: 600, bottom: 770, width: 240, height: 60 },
+  }, 120, 18, 1440);
+  assert(upTight.left >= 608, '左侧不足时移到文字块右侧，不遮挡昵称简介: left=' + upTight.left);
+  assert(!upTight.maxW, '该场景同样不截断');
+  assert(upTight.left + 120 <= 1000, '未越出 UP 面板右边界');
+  // 3c 右侧也放不下：退到面板下方
+  const upBelow = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 700, bottom: 780, width: 400, height: 80 },
+    guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
+    text: { left: 360, top: 710, right: 690, bottom: 770, width: 330, height: 60 },
+  }, 120, 18, 1440);
+  assert(upBelow.top >= 784, '两侧都放不下时移到面板下方: top=' + upBelow.top);
+  assert(upBelow.left === 300, '下方方案左对齐 UP 面板: left=' + upBelow.left);
+
   // UP 定位回归
-  const pUp = rt.computePos('up', { main: { left: 300, top: 1050, right: 800, bottom: 1110, width: 500, height: 60 }, guard: { left: 352, top: 1055, right: 400, bottom: 1103, width: 48, height: 48 } }, 40, 18, 1440);
-  assert(pUp.left === 302 && pUp.maxW === 44, 'UP 标记仍在面板最左内侧: ' + JSON.stringify(pUp));
+  const pUp = rt.computePos('up', { main: { left: 300, top: 1050, right: 800, bottom: 1110, width: 500, height: 60 }, guard: { left: 352, top: 1055, right: 400, bottom: 1103, width: 48, height: 48 }, text: { left: 410, top: 1070, right: 530, bottom: 1090, width: 120, height: 20 } }, 40, 18, 1440);
+  assert(pUp.left === 302, 'UP 标记仍在面板最左内侧: ' + JSON.stringify(pUp));
 
   // 不污染页面 DOM
   assert(csr.querySelector('.rt-box') === null, '评论 shadow DOM 内无注入节点');
