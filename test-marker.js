@@ -12,7 +12,8 @@ function stubGM(window) {
   window.GM_setValue = (k, v) => { mem[k] = v; };
   window.GM_getValue = (k, d) => (k in mem ? mem[k] : d);
   window.GM_addStyle = (css) => { const s = window.document.createElement('style'); s.textContent = css; window.document.head.appendChild(s); };
-  window.GM_registerMenuCommand = (n, fn) => menus.push([n, fn]);
+  window.GM_registerMenuCommand = (n, fn) => { menus.push([n, fn]); return menus.length; };
+  window.GM_unregisterMenuCommand = (id) => { const it = menus[id - 1]; if (it) it[0] = '(removed)'; };
   return { mem, menus };
 }
 
@@ -208,27 +209,74 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(upWide.left === 102, 'UP 左侧空间足够时放在红框位置: left=' + upWide.left);
   assert(!upWide.maxW, '不再因空间不足而截断（无限宽）: maxW=' + upWide.maxW);
   assert(upWide.left + 120 <= 260, '未越过头像左边界');
-  // 3b 左侧空白窄（此前会被压成 28px 半截）：改放头像/文字块右侧
-  const upTight = rt.computePos('up', {
-    main: { left: 300, top: 700, right: 1000, bottom: 780, width: 700, height: 80 },
+  // 3b 左侧空白窄：改放昵称右侧（同一水平线），且必须避开充电/关注按钮
+  const upName = { left: 360, top: 710, right: 460, bottom: 730, width: 100, height: 20 };
+  const upCharge = { left: 480, top: 705, right: 560, bottom: 745, width: 80, height: 40 };
+  const upFollow = { left: 570, top: 705, right: 680, bottom: 745, width: 110, height: 40 };
+  // 3b-1 昵称右侧是空白（截图里的真实布局：按钮在下一行）：紧贴昵称
+  const upSepCharge = { left: 480, top: 750, right: 560, bottom: 790, width: 80, height: 40 };
+  const upTightFree = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 900, bottom: 800, width: 600, height: 100 },
     guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
     text: { left: 360, top: 710, right: 600, bottom: 770, width: 240, height: 60 },
-  }, 120, 18, 1440);
-  assert(upTight.left >= 608, '左侧不足时移到文字块右侧，不遮挡昵称简介: left=' + upTight.left);
-  assert(!upTight.maxW, '该场景同样不截断');
-  assert(upTight.left + 120 <= 1000, '未越出 UP 面板右边界');
-  // 3c 右侧也放不下：退到面板下方
-  const upBelow = rt.computePos('up', {
-    main: { left: 300, top: 700, right: 700, bottom: 780, width: 400, height: 80 },
+    name: upName, avoids: [upSepCharge],
+  }, 60, 18, 1440);
+  assert(upTightFree.left === 468, '左侧不足时紧贴昵称右侧: left=' + upTightFree.left);
+  assert(upTightFree.top >= 710 && upTightFree.top <= 730, '与昵称同一水平线: top=' + upTightFree.top);
+  assert(!rt.collides(upTightFree.left, upTightFree.top, 60, 18, [upSepCharge]), '未压到充电按钮');
+  assert(!upTightFree.maxW, '该场景同样不截断');
+  // 3b-2 昵称右侧正好是按钮：退到按钮之后，仍保持同一行
+  const upTight = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 900, bottom: 780, width: 600, height: 80 },
     guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
-    text: { left: 360, top: 710, right: 690, bottom: 770, width: 330, height: 60 },
-  }, 120, 18, 1440);
-  assert(upBelow.top >= 784, '两侧都放不下时移到面板下方: top=' + upBelow.top);
-  assert(upBelow.left === 300, '下方方案左对齐 UP 面板: left=' + upBelow.left);
+    text: { left: 360, top: 710, right: 600, bottom: 770, width: 240, height: 60 },
+    name: upName, avoids: [upCharge, upFollow],
+  }, 60, 18, 1440);
+  assert(upTight.left >= upFollow.right + 8, '右侧是按钮时退到按钮之后: left=' + upTight.left);
+  assert(upTight.top >= 710 && upTight.top <= 730, '仍与昵称同一水平线: top=' + upTight.top);
+  assert(!rt.collides(upTight.left, upTight.top, 60, 18, [upCharge, upFollow]), '未压到充电/关注按钮');
+  assert(!upTight.maxW, '该场景同样不截断');
+  // 3c 昵称右侧就是按钮（截图场景）：退到昵称下方
+  const upName2 = { left: 360, top: 710, right: 480, bottom: 730, width: 120, height: 20 };
+  const upCharge2 = { left: 490, top: 700, right: 600, bottom: 780, width: 110, height: 80 };
+  const upBlocked = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 900, bottom: 780, width: 600, height: 80 },
+    guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
+    text: { left: 360, top: 710, right: 600, bottom: 770, width: 240, height: 60 },
+    name: upName2, avoids: [upCharge2],
+  }, 60, 18, 1440);
+  assert(upBlocked.left >= upCharge2.right + 8, '昵称右侧被按钮占据时放到按钮之后: left=' + upBlocked.left);
+  assert(!rt.collides(upBlocked.left, upBlocked.top, 60, 18, [upCharge2]), '未压到充电按钮');
+  // 3d 整行都被按钮占满：退到昵称下方
+  const upFullBtn = { left: 490, top: 700, right: 890, bottom: 780, width: 400, height: 80 };
+  const upBelow = rt.computePos('up', {
+    main: { left: 300, top: 700, right: 900, bottom: 780, width: 600, height: 80 },
+    guard: { left: 305, top: 705, right: 353, bottom: 753, width: 48, height: 48 },
+    text: { left: 360, top: 710, right: 600, bottom: 770, width: 240, height: 60 },
+    name: upName2, avoids: [upFullBtn],
+  }, 60, 18, 1440);
+  assert(upBelow.top >= 734, '整行被按钮占满时退到昵称下方: top=' + upBelow.top);
+  assert(!rt.collides(upBelow.left, upBelow.top, 60, 18, [upFullBtn]), '下方方案未压到按钮');
 
   // UP 定位回归
   const pUp = rt.computePos('up', { main: { left: 300, top: 1050, right: 800, bottom: 1110, width: 500, height: 60 }, guard: { left: 352, top: 1055, right: 400, bottom: 1103, width: 48, height: 48 }, text: { left: 410, top: 1070, right: 530, bottom: 1090, width: 120, height: 20 } }, 40, 18, 1440);
   assert(pUp.left === 302, 'UP 标记仍在面板最左内侧: ' + JSON.stringify(pUp));
+
+  // 修复 4：菜单显示当前状态（显示/隐藏）
+  const visMenu = () => menus.filter((m) => m[0] && /显示标记|隐藏标记/.test(m[0]) && !/removed/.test(m[0])).pop();
+  assert(!!visMenu(), '存在显示/隐藏菜单项');
+  assert(/当前：显示中/.test(visMenu()[0]), '初始状态显示「当前：显示中」: ' + visMenu()[0]);
+  assert(/^隐藏标记/.test(visMenu()[0]), '当前可见时菜单提示的是「隐藏标记」');
+  const toggleStealth = menus.find((m) => /Alt\+Shift\+M/.test(m[0]) && !/removed/.test(m[0]));
+  assert(!!toggleStealth, '快捷键仍绑定在显示/隐藏上');
+  toggleStealth[1]();
+  const m2 = visMenu();
+  assert(/当前：已隐藏/.test(m2[0]), '切换后菜单显示「当前：已隐藏」: ' + m2[0]);
+  assert(/^显示标记/.test(m2[0]), '当前隐藏时菜单提示的是「显示标记」');
+  assert(overlay.style.display === 'none', '隐藏时浮层确实不可见');
+  toggleStealth[1]();
+  assert(/当前：显示中/.test(visMenu()[0]), '再切换回「当前：显示中」');
+  assert(overlay.style.display !== 'none', '恢复显示');
 
   // 不污染页面 DOM
   assert(csr.querySelector('.rt-box') === null, '评论 shadow DOM 内无注入节点');
@@ -303,13 +351,35 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(saved.users['29508762'].tags.includes('主机区UP'), '空间页成功打标记');
   assert(saved.users['29508762'].items[0].type === 'space', '留痕类型为 space');
 
-  // 空间页标记定位：昵称右侧
-  const pSpace = rt.computePos('right', {
-    main: { left: 200, top: 150, right: 360, bottom: 178, width: 160, height: 28 },
-    container: { left: 100, top: 100, right: 900, bottom: 300, width: 800, height: 200 },
+  // 空间页定位：紧贴昵称右侧，且避开充电/关注按钮
+  const nickRect = { left: 200, top: 150, right: 360, bottom: 178, width: 160, height: 28 };
+  const chargeBtn = { left: 380, top: 150, right: 460, bottom: 178, width: 80, height: 28 };
+  const followBtn = { left: 470, top: 150, right: 570, bottom: 178, width: 100, height: 28 };
+  // 真实布局：充电/关注在昵称下方一行
+  const chargeBelow = { left: 200, top: 200, right: 300, bottom: 240, width: 100, height: 40 };
+  const followBelow = { left: 310, top: 200, right: 430, bottom: 240, width: 120, height: 40 };
+  const pSpace = rt.computePos('nameRight', {
+    main: nickRect, name: nickRect, text: nickRect, container: { left: 100, top: 100, right: 900, bottom: 300, width: 800, height: 200 },
+    limit: 900, avoids: [chargeBelow, followBelow],
   }, 40, 18, 1440);
-  assert(pSpace.left > 360, '空间标记右移到空白区: left=' + pSpace.left);
-  assert(pSpace.top > 150 && pSpace.top < 178, '与昵称垂直对齐: top=' + pSpace.top);
+  assert(pSpace.left === 368, '空间标记紧贴昵称右侧: left=' + pSpace.left);
+  assert(pSpace.top > 150 && pSpace.top < 178, '与昵称同一水平线: top=' + pSpace.top);
+  assert(!rt.collides(pSpace.left, pSpace.top, 40, 18, [chargeBelow, followBelow]), '未压到充电/关注按钮');
+  // 按钮就在昵称右边：退到按钮之后
+  const pSpaceBtn = rt.computePos('nameRight', {
+    main: nickRect, name: nickRect, text: nickRect, container: { left: 100, top: 100, right: 900, bottom: 300, width: 800, height: 200 },
+    limit: 900, avoids: [chargeBtn, followBtn],
+  }, 40, 18, 1440);
+  assert(pSpaceBtn.left >= followBtn.right + 8, '右侧是按钮时退到按钮之后: left=' + pSpaceBtn.left);
+  assert(pSpaceBtn.top > 150 && pSpaceBtn.top < 178, '仍与昵称同一水平线: top=' + pSpaceBtn.top);
+  assert(!rt.collides(pSpaceBtn.left, pSpaceBtn.top, 40, 18, [chargeBtn, followBtn]), '未压到按钮');
+  // 右侧被按钮占满时退到昵称下方
+  const pSpace2 = rt.computePos('nameRight', {
+    main: nickRect, name: nickRect, text: nickRect, container: { left: 100, top: 100, right: 600, bottom: 300, width: 500, height: 200 },
+    limit: 372, avoids: [chargeBtn, followBtn],
+  }, 40, 18, 1440);
+  assert(pSpace2.top >= 178, '右侧放不下时退到昵称下方: top=' + pSpace2.top);
+  assert(!rt.collides(pSpace2.left, pSpace2.top, 40, 18, [chargeBtn, followBtn]), '下方方案也未压到按钮');
 }
 
 /* ==================================================================== */
