@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.4.1
+// @version      1.5.0
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区行右侧、视频卡片UP名右侧、播放页昵称右侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -59,7 +59,11 @@
   const MAX_TAG_LIB = 500;         // 历史标记（下拉候选）上限
   const MAX_CHIPS = 3;             // 页面上最多直接展示的标记个数，其余折叠为 +N
   const SHADOW_DEPTH = 4;          // 递归下潜 Shadow DOM 的层数（B站新组件是 Web Component）
-  const MAX_BOXES = 400;           // 浮层里同时渲染的标记框上限，超出按视口距离淘汰
+  const MAX_BOXES = 150;           // 浮层里同时渲染的标记框上限，超出按视口距离淘汰
+  const MAX_TARGETS = 300;         // 追踪的锚点总数上限，防止长列表无限膨胀
+  const SCAN_INTERVAL = 8000;      // 兜底全量扫描间隔（主要靠 MutationObserver 驱动）
+  const SHADOW_CACHE_TTL = 4000;   // shadow root 列表缓存有效期，避免每次扫描全量遍历 DOM
+  const VIEW_MARGIN = 200;         // 视口外这么多像素内的锚点仍参与定位，之外的直接跳过计算
 
   const LINK_SEL = 'a[href*="space.bilibili.com/"]';
   const CARD_SEL = ['bili-video-card', '.bili-video-card', '.video-card', '.small-item'];
@@ -230,7 +234,18 @@
 
   // 遍历 document 及所有 ShadowRoot（只读，绝不修改）
   function forEachRoot(cb) {
-    cb(document);
+    for (const r of getShadowRoots()) cb(r);
+  }
+
+  // shadow root 的发现需要全量遍历 DOM，代价很高；这里缓存结果，
+  // 只在缓存过期后重新发现（B站评论懒加载时最多延迟一个周期生效）。
+  let shadowCache = null;
+  let shadowCacheAt = 0;
+
+  function getShadowRoots() {
+    const now = Date.now();
+    if (shadowCache && now - shadowCacheAt < SHADOW_CACHE_TTL) return shadowCache;
+    const roots = [document];
     let frontier = [document];
     for (let d = 0; d < SHADOW_DEPTH; d++) {
       const next = [];
@@ -238,12 +253,26 @@
         let els;
         try { els = root.querySelectorAll('*'); } catch (e) { continue; }
         for (const el of els) {
-          if (el.shadowRoot) { cb(el.shadowRoot); next.push(el.shadowRoot); }
+          if (el.shadowRoot) { roots.push(el.shadowRoot); next.push(el.shadowRoot); }
         }
       }
       if (!next.length) break;
       frontier = next;
     }
+    shadowCache = roots;
+    shadowCacheAt = now;
+    return roots;
+  }
+
+  // 元素 -> 昵称文本。textOf 会递归遍历子树，缓存后扫描时不再重复计算。
+  const nickCache = new WeakMap();
+
+  function nickOf(el) {
+    if (!el) return '';
+    if (nickCache.has(el)) return nickCache.get(el);
+    const v = (textOf(el) || el.getAttribute('title') || '').replace(/^@/, '').trim().slice(0, 60);
+    try { nickCache.set(el, v); } catch (e) { /* 忽略 */ }
+    return v;
   }
 
   function deepFindFirst(root, sels) {
@@ -676,7 +705,7 @@
   // UP / 空间页里的操作按钮（充电、关注等），标记必须避开它们
   const BTN_SEL = ['button', '.btn', '[class*="btn"]', '[class*="follow"]', '[class*="charge"]', '[class*="attention"]', '[class*="guanzhu"]'];
 
-  function avoidRects(host, a) {
+  function findAvoidEls(host, a) {
     const out = [];
     const roots = [];
     const tryPush = (el) => { if (el) roots.push(el.shadowRoot || el); };
@@ -687,19 +716,36 @@
       let els;
       try { els = r.querySelectorAll(BTN_SEL.join(',')); } catch (e) { continue; }
       for (const el of els) {
-        const rc = rectOf(el);
-        if (!rc) continue;
-        let dup = false;
-        for (const x of out) {
-          if (Math.abs(x.left - rc.left) < 3 && Math.abs(x.top - rc.top) < 3) { dup = true; break; }
-        }
-        if (dup) continue;
-        out.push(rc);
         if (out.length >= 8) break;
+        if (out.indexOf(el) !== -1) continue;
+        out.push(el);
       }
       if (out.length >= 8) break;
     }
     return out;
+  }
+
+  // 按钮矩形随滚动变化必须重算，但「哪些是按钮」只需找一次，缓存在 rec 上
+  function avoidRectsOf(rec) {
+    if (rec.avoidEls === undefined) rec.avoidEls = findAvoidEls(rec.host, rec.a);
+    const els = rec.avoidEls;
+    const out = [];
+    if (!els || !els.length) return out;
+    for (const el of els) {
+      const rc = rectOf(el);
+      if (!rc) continue;
+      let dup = false;
+      for (const x of out) {
+        if (Math.abs(x.left - rc.left) < 3 && Math.abs(x.top - rc.top) < 3) { dup = true; break; }
+      }
+      if (dup) continue;
+      out.push(rc);
+    }
+    return out;
+  }
+
+  function avoidRects(host, a) {
+    return avoidRectsOf({ host: host, a: a });
   }
 
   // 矩形是否相交（标记框 vs 按钮）
@@ -738,7 +784,7 @@
       return {
         main: aRect, name: aRect, container: cont,
         limit: cont ? cont.right : (window.innerWidth - 6),
-        avoids: avoidRects(rec.host, a),
+        avoids: avoidRectsOf(rec),
         mode: 'nameRight',
       };
     }
@@ -754,8 +800,10 @@
       // text：UP 昵称 / 简介所在的文字块，标记必须避开它
       let textRect = null;
       try {
-        const infoEl = deepFindFirst(host && (host.shadowRoot || host), ['.up-info--container', '.up-detail-container', '[class*="up-info"]', '.up-detail', '.info']);
-        if (infoEl) textRect = infoEl.getBoundingClientRect();
+        if (rec.infoEl === undefined) {
+          rec.infoEl = deepFindFirst(host && (host.shadowRoot || host), ['.up-info--container', '.up-detail-container', '[class*="up-info"]', '.up-detail', '.info']);
+        }
+        if (rec.infoEl) textRect = rec.infoEl.getBoundingClientRect();
       } catch (e) { /* 忽略 */ }
       if (!textRect || (!textRect.width && !textRect.height)) textRect = aRect;
       return {
@@ -763,7 +811,7 @@
         guard: avRect && (avRect.width || avRect.height) ? avRect : aRect,
         text: textRect,
         name: aRect,
-        avoids: avoidRects(host, a),
+        avoids: avoidRectsOf(rec),
         mode: 'up',
       };
     }
@@ -773,8 +821,8 @@
     rec.title = t;
     let ownerRect = null;
     try {
-      const ow = findCardOwner(rec.host);
-      if (ow) ownerRect = ow.getBoundingClientRect();
+      if (rec.ownerEl === undefined) rec.ownerEl = findCardOwner(rec.host);
+      if (rec.ownerEl) ownerRect = rec.ownerEl.getBoundingClientRect();
     } catch (e) { /* 忽略 */ }
     if (!ownerRect || (!ownerRect.width && !ownerRect.height)) ownerRect = aRect;
     let cardRect = null;
@@ -786,7 +834,7 @@
       text: ownerRect,
       container: okCard,
       limit: okCard ? okCard.right - 4 : (window.innerWidth - 6),
-      avoids: avoidRects(rec.host, a),
+      avoids: avoidRectsOf(rec),
       mode: 'cardRight',
     };
   }
@@ -898,8 +946,9 @@
 
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const shown = [];
 
+    /* ---- 阶段 1：只读。集中读取几何信息，避免与写入交替触发强制同步布局 ---- */
+    const jobs = [];
     targets.forEach((rec) => {
       let box = rec.box;
       if (!box) {
@@ -908,28 +957,59 @@
         rec.rev = -1;
         overlay.appendChild(box);
       }
-      if (rec.rev !== storeRev) { renderBox(rec); rec.rev = storeRev; }
+      if (rec.rev !== storeRev) {
+        renderBox(rec);
+        rec.rev = storeRev;
+        rec.bw = 0; rec.bh = 0; // 内容变了，缓存的尺寸失效
+      }
 
-      if (!rec.a.isConnected) { box.style.display = 'none'; return; }
+      if (!rec.a.isConnected) { jobs.push({ rec: rec, box: box, hide: true }); return; }
+
+      // 快速剔除：先用锚点自身的矩形判断是否在视口附近，远离视口就不再做昂贵计算
+      let aRect = null;
+      try { aRect = rec.a.getBoundingClientRect(); } catch (e) { /* 忽略 */ }
+      if (!aRect || (!aRect.width && !aRect.height)) { jobs.push({ rec: rec, box: box, hide: true }); return; }
+      if (aRect.bottom < -VIEW_MARGIN || aRect.top > vh + VIEW_MARGIN) {
+        jobs.push({ rec: rec, box: box, hide: true });
+        return;
+      }
+
       const rects = refRects(rec);
-      if (!rects) { box.style.display = 'none'; return; }
+      if (!rects) { jobs.push({ rec: rec, box: box, hide: true }); return; }
       const m = rects.main;
-      if (m.bottom < -120 || m.top > vh + 120 || (!m.width && !m.height)) { box.style.display = 'none'; return; }
+      if (m.bottom < -VIEW_MARGIN || m.top > vh + VIEW_MARGIN || (!m.width && !m.height)) {
+        jobs.push({ rec: rec, box: box, hide: true });
+        return;
+      }
+      jobs.push({ rec: rec, box: box, rects: rects, hide: false });
+    });
 
+    // 尺寸只在内容变化后测一次，之后复用缓存（offsetWidth 会强制同步布局）
+    for (const j of jobs) {
+      if (j.hide) continue;
+      if (!j.rec.bw) {
+        j.rec.bw = j.box.offsetWidth || 40;
+        j.rec.bh = j.box.offsetHeight || 18;
+      }
+    }
+
+    /* ---- 阶段 2：只写。批量应用样式 ---- */
+    const shown = [];
+    for (const j of jobs) {
+      const rec = j.rec, box = j.box;
+      if (j.hide) { box.style.display = 'none'; continue; }
       box.style.display = '';
-      const bw = box.offsetWidth || 40;
-      const bh = box.offsetHeight || 18;
-      const pos = computePos(rects.mode, rects, bw, bh, vw);
+      const pos = computePos(j.rects.mode, j.rects, rec.bw || 40, rec.bh || 18, vw);
       if (pos.maxW) box.style.maxWidth = pos.maxW + 'px';
       else box.style.maxWidth = '';
       box.style.transform = 'translate(' + pos.left + 'px,' + pos.top + 'px)';
-      shown.push({ rec, top: pos.top });
-    });
+      shown.push({ rec: rec, box: box, top: pos.top });
+    }
 
     // 数量保护：超出上限时隐藏视口外的
     if (shown.length > MAX_BOXES) {
       shown.sort((x, y) => x.top - y.top);
-      for (let i = 0; i < shown.length - MAX_BOXES; i++) shown[i].rec.box.style.display = 'none';
+      for (let i = 0; i < shown.length - MAX_BOXES; i++) shown[i].box.style.display = 'none';
     }
   }
 
@@ -937,10 +1017,13 @@
 
   let scanTimer = null;
   let layoutPending = false;
+  let lastScanAt = 0;
+  const SCAN_MIN_GAP = 1500; // 连续 DOM 变动时两次全量扫描的最小间隔
 
   function scheduleScan() {
     if (scanTimer) return;
-    scanTimer = setTimeout(() => { scanTimer = null; scan(); }, 500);
+    const wait = Math.max(500, SCAN_MIN_GAP - (Date.now() - lastScanAt));
+    scanTimer = setTimeout(() => { scanTimer = null; scan(); }, wait);
   }
 
   function requestLayout() {
@@ -953,6 +1036,7 @@
 
   function scan() {
     if (!document.body) return;
+    lastScanAt = Date.now();
     if (!store.settings.enabled) { if (overlay) overlay.style.display = 'none'; return; }
 
     // 清理已失效的锚点
@@ -967,20 +1051,34 @@
     const spacePage = isSpacePage();
     const ownerUid = spacePage ? spaceUid() : '';
     const cands = [];
+    let budget = MAX_TARGETS; // 锚点预算：长列表下不再无上限增长
     forEachRoot((root) => {
       let as;
       try { as = root.querySelectorAll(LINK_SEL); } catch (e) { return; }
       for (const a of as) {
+        if (budget <= 0) return;
         const uid = uidFromHref(hrefOf(a));
         if (!uid) continue;
         // 空间页里，主人的视频卡片、动态全都同 UID，只在昵称处标一次，避免满屏重复
         if (ownerUid && uid === ownerUid && !isSpaceOwnerEl(a)) continue;
+        // 已在追踪中：只需更新矩形用于去重，跳过 classify / textOf 等昂贵计算
+        const known = targets.get(a);
+        if (known) {
+          const rect = rectOf(a);
+          if (!rect) continue;
+          cands.push({
+            a: a, uid: known.uid, nick: known.nick, scene: known.scene, host: known.host,
+            rect: rect, isAvatar: known.isAvatar || false, cached: true,
+          });
+          continue;
+        }
         const c = classify(a);
         if (!c) continue;
         const rect = rectOf(a);
         // 完全不可见（无尺寸）的链接跳过：多为隐藏的重复节点
         if (!rect) continue;
-        const nick = (textOf(a) || a.getAttribute('title') || '').replace(/^@/, '').trim().slice(0, 60);
+        const nick = nickOf(a);
+        budget--;
         cands.push({ a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, rect: rect, isAvatar: isAvatarLink(a) });
       }
     });
@@ -1022,9 +1120,10 @@
       if (old) {
         // 已存在：只更新可能变化的信息，保留 box
         old.uid = c.uid; old.nick = c.nick; old.scene = c.scene; old.host = c.host;
+        old.isAvatar = c.isAvatar;
         continue;
       }
-      targets.set(c.a, { a: c.a, uid: c.uid, nick: c.nick, scene: c.scene, host: c.host, box: null, rev: -1 });
+      targets.set(c.a, { a: c.a, uid: c.uid, nick: c.nick, scene: c.scene, host: c.host, isAvatar: c.isAvatar, box: null, rev: -1 });
     }
 
     const missing = [];
@@ -1677,13 +1776,14 @@
       new MutationObserver(() => scheduleScan()).observe(document.body, { childList: true, subtree: true });
     } catch (e) { /* 忽略 */ }
 
-    // 位置跟随滚动 / 缩放
-    window.addEventListener('scroll', requestLayout, true);
-    window.addEventListener('resize', requestLayout);
-    document.addEventListener('scroll', requestLayout, true);
+    // 位置跟随滚动 / 缩放：passive 避免阻塞滚动，rAF 节流避免每帧多次计算
+    const passiveOpt = { passive: true, capture: true };
+    window.addEventListener('scroll', requestLayout, passiveOpt);
+    window.addEventListener('resize', requestLayout, { passive: true });
+    document.addEventListener('scroll', requestLayout, passiveOpt);
 
-    // 定时兜底：应对纯 CSS 布局变化与懒加载
-    setInterval(() => { scan(); }, 3000);
+    // 定时兜底：应对纯 CSS 布局变化与懒加载（频率已下调，主要靠 MutationObserver）
+    setInterval(() => { scan(); }, SCAN_INTERVAL);
 
     window.addEventListener('keydown', (e) => {
       if (e.altKey && e.shiftKey && (e.key === 'M' || e.key === 'm')) { e.preventDefault(); toggleStealth(); }
@@ -1773,5 +1873,8 @@
     purgeCSS: purgeCSS,
     visibilityLabel: visibilityLabel,
     collides: collides,
+    layout: layout,
+    scan: scan,
+    shadowRoots: getShadowRoots,
   };
 })();
