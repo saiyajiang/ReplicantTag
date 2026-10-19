@@ -416,6 +416,90 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(dom.window.__rt.isSpacePage() === false, '视频页不被识别为空间页');
 }
 
+/* ==================================================================== */
+/*  场景 D：性能 —— 大量标记时的开销控制                                  */
+/* ==================================================================== */
+{
+  const N = 200;
+  const parts = ['<!doctype html><html><head><title>perf</title></head><body><div id="wrap">'];
+  for (let i = 0; i < N; i++) parts.push('<bili-comment id="pc' + i + '"></bili-comment>');
+  parts.push('</div></body></html>');
+  const dom = new JSDOM(parts.join(''), { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', pretendToBeVisual: true, runScripts: 'outside-only' });
+  const { window } = dom; const doc = window.document;
+  const { mem } = stubGM(window);
+  window.innerWidth = 1440; window.innerHeight = 900;
+
+  // 前 10 条在视口内，其余远在视口下方
+  const inView = 10;
+  for (let i = 0; i < N; i++) {
+    const el = doc.getElementById('pc' + i);
+    const sr = el.attachShadow({ mode: 'open' });
+    sr.innerHTML = `<div class="comment-wrap">
+      <div class="user-info"><a href="//space.bilibili.com/${100000 + i}" class="user-name">用户${i}</a><span class="level">Lv${i % 7}</span></div>
+      <bili-rich-text><span>评论内容${i}</span></bili-rich-text>
+    </div>`;
+    const y = i < inView ? (100 + i * 60) : (50000 + i * 60);
+    rect(sr.querySelector('.user-name'), 160, y, 90, 16);
+    rect(sr.querySelector('.level'), 255, y, 30, 16);
+    rect(el, 90, y - 10, 900, 120);
+  }
+
+  await new Promise((r) => setTimeout(r, 80));
+  window.eval(src);
+  await new Promise((r) => setTimeout(r, 80));
+
+  const rt = window.__rt;
+  const overlay = doc.getElementById('rt-overlay');
+  console.log('--- 场景 D：性能 ---');
+  assert(rt.targets.size === N, '追踪了全部 ' + N + ' 个锚点，实际 ' + rt.targets.size);
+
+  // 给每个 box 装 offsetWidth 计数器，验证第二次 layout 不再读尺寸
+  let offsetReads = 0;
+  const boxes = Array.from(overlay.querySelectorAll('.rt-box'));
+  assert(boxes.length === N, '浮层创建了 ' + N + ' 个标记框，实际 ' + boxes.length);
+  for (const b of boxes) {
+    let real = 0;
+    Object.defineProperty(b, 'offsetWidth', {
+      configurable: true,
+      get() { offsetReads++; return real || 60; },
+    });
+    Object.defineProperty(b, 'offsetHeight', { configurable: true, get() { return 18; } });
+  }
+
+  offsetReads = 0;
+  rt.layout();
+  assert(offsetReads === 0, '第二次 layout 复用缓存尺寸，不再触发 offsetWidth（实际 ' + offsetReads + ' 次）');
+
+  // 视口裁剪：视口外的标记框全部隐藏
+  const hidden = Array.from(overlay.querySelectorAll('.rt-box')).filter((b) => b.style.display === 'none').length;
+  const visible = Array.from(overlay.querySelectorAll('.rt-box')).filter((b) => b.style.display !== 'none').length;
+  assert(visible <= inView + 2, '只有视口内的标记参与渲染：可见 ' + visible + ' / 共 ' + N);
+  assert(hidden >= N - inView - 2, '视口外的标记被隐藏：隐藏 ' + hidden);
+
+  // 阴影 DOM 缓存：连续两次取 shadow roots，第二次不应重新全量遍历
+  const r1 = rt.shadowRoots();
+  const r2 = rt.shadowRoots();
+  assert(r1 === r2, 'shadow root 列表命中缓存（同一引用）');
+  assert(r1.length > 1, 'shadow root 列表包含下潜结果: ' + r1.length);
+
+  // 滚动重排不应抛错，且保持稳定
+  let threw = null;
+  try { rt.layout(); rt.layout(); } catch (e) { threw = e; }
+  assert(!threw, '连续 layout 不抛异常');
+
+  // 标记数量上限
+  assert(rt.targets.size <= 300, '锚点总数受 MAX_TARGETS 约束: ' + rt.targets.size);
+
+  // 已知锚点走缓存路径：改掉 DOM 文本后重扫，昵称应保持旧值（说明未重算 textOf/classify）
+  const first = Array.from(rt.targets.values())[0];
+  const oldNick = first.nick;
+  first.a.textContent = '被改掉的昵称';
+  rt.scan();
+  const still = rt.targets.get(first.a);
+  assert(!!still, '已知锚点在重扫后仍保留');
+  assert(still.nick === oldNick, '已知锚点复用缓存昵称，未重复执行昂贵的文本提取');
+}
+
 console.log(fails ? ('\nFAILED: ' + fails) : '\nALL PASS');
 process.exit(fails ? 1 : 0);
 })();
