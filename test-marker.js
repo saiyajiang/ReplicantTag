@@ -500,6 +500,111 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(still.nick === oldNick, '已知锚点复用缓存昵称，未重复执行昂贵的文本提取');
 }
 
+/* ==================================================================== */
+/*  场景 E：楼中楼（子回复）—— 展开后必须立刻出现标记入口                  */
+/* ==================================================================== */
+{
+  const html = `<!doctype html><html><head><title>楼中楼测试 - 哔哩哔哩</title></head><body>
+  <div class="video-info"><h1 class="video-title">楼中楼测试</h1></div>
+  <div id="comment"><bili-comment id="root-cmt"></bili-comment></div>
+  </body></html>`;
+  const dom = new JSDOM(html, { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', pretendToBeVisual: true, runScripts: 'outside-only' });
+  const { window } = dom; const doc = window.document;
+  const { mem } = stubGM(window);
+  window.innerWidth = 1440; window.innerHeight = 900;
+
+  const rootCmt = doc.getElementById('root-cmt');
+  const sr = rootCmt.attachShadow({ mode: 'open' });
+  sr.innerHTML = `<div class="root-reply">
+    <div class="user-info"><a href="//space.bilibili.com/111" class="user-name">楼主</a><span class="level">Lv5</span></div>
+    <bili-rich-text><span>主评论内容</span></bili-rich-text>
+    <div class="sub-reply-list" id="sub-list"></div>
+  </div>`;
+  rect(sr.querySelector('.user-name'), 160, 100, 90, 16);
+  rect(sr.querySelector('.level'), 255, 100, 30, 16);
+  rect(rootCmt, 90, 90, 900, 300);
+
+  await new Promise((r) => setTimeout(r, 80));
+  window.eval(src);
+  await new Promise((r) => setTimeout(r, 80));
+
+  const rt = window.__rt;
+  const overlay = doc.getElementById('rt-overlay');
+  console.log('--- 场景 E：楼中楼 ---');
+  assert(rt.targets.size === 1, '初始只有主评论 1 个锚点，实际 ' + rt.targets.size);
+
+  // === 关键：在 shadow DOM 内部动态展开 3 条楼中楼 ===
+  // 注意 body 的 MutationObserver 收不到 shadow 内部变动，必须给 shadowRoot 单独挂
+  const subList = sr.getElementById('sub-list');
+  const makeReply = (uid, name, y, viaDataAttr) => {
+    const item = doc.createElement('div');
+    item.className = 'sub-reply-item';
+    if (viaDataAttr) {
+      item.innerHTML = `<div class="sub-user"><span class="sub-reply-user-name" data-user-id="${uid}">${name}</span></div>
+        <bili-rich-text><span>楼中楼回复 by ${name}</span></bili-rich-text>`;
+    } else {
+      item.innerHTML = `<div class="sub-user"><a href="//space.bilibili.com/${uid}" class="sub-reply-user-name">${name}</a></div>
+        <bili-rich-text><span>楼中楼回复 by ${name}</span></bili-rich-text>`;
+    }
+    subList.appendChild(item);
+    const nickEl = item.querySelector('.sub-reply-user-name');
+    rect(nickEl, 200, y, 100, 16);
+    rect(item, 190, y - 4, 700, 40);
+    return nickEl;
+  };
+
+  const r1 = makeReply(222, '回复者A', 200, false);   // 标准链接
+  const r2 = makeReply(222, '回复者A', 245, false);   // 同一用户，另一层楼（不应被合并）
+  const r3 = makeReply(333, '回复者B', 290, true);    // 只有 data-user-id，没有 space 链接
+
+  // 再挂一个自带 shadowRoot 的新 Web Component，验证增量发现
+  const wc = doc.createElement('bili-comment-reply-renderer');
+  wc.id = 'wc-reply';
+  const wsr = wc.attachShadow({ mode: 'open' });
+  wsr.innerHTML = `<div class="sub-reply-item"><a href="//space.bilibili.com/444" class="user-name">回复者C</a></div>`;
+  subList.appendChild(wc);
+  rect(wsr.querySelector('.user-name'), 200, 335, 100, 16);
+  rect(wc, 190, 330, 700, 40);
+
+  // 等待 MutationObserver + 快速重扫
+  await new Promise((r) => setTimeout(r, 700));
+
+  const recs = Array.from(rt.targets.values());
+  const byUid = (u) => recs.filter((x) => x.uid === u);
+  assert(byUid('222').length === 2, '同一用户在楼中楼的两条回复各有一个标记入口，实际 ' + byUid('222').length);
+  assert(byUid('222').every((x) => x.a.className === 'sub-reply-user-name'), '两条回复都锚定在昵称上');
+  assert(byUid('333').length === 1, 'data-user-id 形式的昵称（无 space 链接）也能识别');
+  assert(byUid('444').length === 1, '新展开且自带 shadowRoot 的回复组件被发现（增量 shadow 缓存）');
+  assert(rt.shadowRoots().indexOf(wsr) !== -1, '新 Web Component 的 shadowRoot 已增量加入缓存');
+  assert(rt.targets.size === 5, '主评论 + 4 条楼中楼共 5 个锚点，实际 ' + rt.targets.size);
+
+  // 每条楼中楼都能点开面板
+  const r3Rec = byUid('333')[0];
+  r3Rec.box.querySelector('.rt-mini').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const p = doc.querySelector('.rt-panel');
+  assert(!!p, '楼中楼标记可点开面板');
+  assert(/评论/.test(p.querySelector('.rt-ctx').textContent), '楼中楼按评论场景留痕');
+  p.querySelector('.rt-input').value = '楼中楼测试';
+  Array.from(p.querySelectorAll('.rt-btn')).find((b) => b.textContent === '添加').dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  const saved = JSON.parse(mem['ReplicantTag_store_v1']);
+  assert(!!saved.users['333'] && saved.users['333'].nickname === '回复者B', '楼中楼标记成功保存（昵称来自 data-user-id 元素）');
+
+  // 相邻楼中楼不合并
+  assert(rt.rectNear({ left: 200, top: 200, right: 300, bottom: 216, width: 100, height: 16 },
+                     { left: 200, top: 245, right: 300, bottom: 261, width: 100, height: 16 }) === false,
+         '上下相邻的两条楼中楼不会被误判为同一处');
+  // 但头像+昵称仍应合并
+  assert(rt.rectNear({ left: 100, top: 300, right: 148, bottom: 348, width: 48, height: 48 },
+                     { left: 160, top: 300, right: 250, bottom: 316, width: 90, height: 16 }) === true,
+         '同一行的头像链接与昵称链接仍会合并');
+
+  // 收起楼中楼后锚点清理
+  subList.innerHTML = '';
+  // 删除节点没有新增，走节流间隔（1.5s），故等待时间需覆盖
+  await new Promise((r) => setTimeout(r, 1900));
+  assert(rt.targets.size === 1, '收起楼中楼后锚点被清理，只剩主评论，实际 ' + rt.targets.size);
+}
+
 console.log(fails ? ('\nFAILED: ' + fails) : '\nALL PASS');
 process.exit(fails ? 1 : 0);
 })();
