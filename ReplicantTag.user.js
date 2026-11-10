@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.5.0
+// @version      1.5.1
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区行右侧、视频卡片UP名右侧、播放页昵称右侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -60,12 +60,18 @@
   const MAX_CHIPS = 3;             // 页面上最多直接展示的标记个数，其余折叠为 +N
   const SHADOW_DEPTH = 4;          // 递归下潜 Shadow DOM 的层数（B站新组件是 Web Component）
   const MAX_BOXES = 150;           // 浮层里同时渲染的标记框上限，超出按视口距离淘汰
-  const MAX_TARGETS = 300;         // 追踪的锚点总数上限，防止长列表无限膨胀
+  const MAX_TARGETS = 500;         // 追踪的锚点总数上限，防止长列表无限膨胀
   const SCAN_INTERVAL = 8000;      // 兜底全量扫描间隔（主要靠 MutationObserver 驱动）
   const SHADOW_CACHE_TTL = 4000;   // shadow root 列表缓存有效期，避免每次扫描全量遍历 DOM
   const VIEW_MARGIN = 200;         // 视口外这么多像素内的锚点仍参与定位，之外的直接跳过计算
 
-  const LINK_SEL = 'a[href*="space.bilibili.com/"]';
+  // 楼中楼（子回复）的昵称有时是 space 链接，有时只带 data-user-id / data-mid
+  const LINK_SEL = [
+    'a[href*="space.bilibili.com"]',
+    'a[data-user-id]', 'a[data-mid]', 'a[data-uid]',
+    '[data-user-id][class*="name"]', '[data-mid][class*="name"]',
+    '[class*="user-name"][data-user-id]', '[class*="reply-user"][data-user-id]',
+  ].join(',');
   const CARD_SEL = ['bili-video-card', '.bili-video-card', '.video-card', '.small-item'];
   const UP_SEL = [
     '.up-panel-container', '.up-info-container', '.up-detail-container', '.up-info--container',
@@ -74,8 +80,12 @@
   ];
   const COMMENT_SEL = [
     'bili-comment', 'bili-comment-thread-renderer', 'bili-comment-reply-renderer',
+    'bili-comment-sub-reply', 'bili-comment-reply', '.sub-reply-item', '.sub-reply',
+    '[class*="sub-reply"]', '[class*="reply-item"]', '[class*="reply-list"]',
     '#comment', '.reply-wrap', '.reply-item', '[class*="comment"]', '[class*="reply"]',
   ];
+  // 楼中楼兜底：判断某链接是否位于评论区大容器内
+  const COMMENT_ROOT_SEL = ['bili-comment', '#comment', '#commentapp', '.comment-list', '[class*="comment-area"]'];
   const LEVEL_SEL = ['bili-comment-user-level', '.level', '.user-level', '[class*="level"]'];
   const AVATAR_SEL = ['.bili-avatar', '[class*="avatar"]', 'img'];
   const TITLE_SEL = ['h1.video-title', '.video-title', '.tit', '.title'];
@@ -238,9 +248,42 @@
   }
 
   // shadow root 的发现需要全量遍历 DOM，代价很高；这里缓存结果，
-  // 只在缓存过期后重新发现（B站评论懒加载时最多延迟一个周期生效）。
+  // 并通过 MutationObserver 增量补进新出现的 shadow root（楼中楼展开就用这条路径）。
   let shadowCache = null;
   let shadowCacheAt = 0;
+  const observedRoots = new WeakSet();
+  const pendingAddedNodes = [];
+  const MAX_PENDING_NODES = 400;
+  const MAX_SHADOW_ROOTS = 800;  // 缓存膨胀到这个量级就强制全量重建，清掉已卸载组件的残留
+
+  function onRootMutation(muts) {
+    let dirty = false;
+    for (const m of muts) {
+      for (const n of m.addedNodes) {
+        if (n && n.nodeType === 1) {
+          pendingAddedNodes.push(n);
+          dirty = true;
+        }
+      }
+      // 楼中楼收起、评论区翻页会删除节点，同样需要重扫清理失效锚点
+      if (m.removedNodes && m.removedNodes.length) dirty = true;
+    }
+    if (pendingAddedNodes.length > MAX_PENDING_NODES) pendingAddedNodes.length = MAX_PENDING_NODES;
+    if (dirty) scheduleScan();
+  }
+
+  // MutationObserver 不会跨 shadow boundary，必须给每个 shadowRoot 单独挂
+  function observeShadowRoots(roots) {
+    for (const r of roots) {
+      if (r === document) continue;
+      if (observedRoots.has(r)) continue;
+      try {
+        const mo = new MutationObserver(onRootMutation);
+        mo.observe(r, { childList: true, subtree: true });
+        observedRoots.add(r);
+      } catch (e) { /* 忽略不可观察的 root */ }
+    }
+  }
 
   function getShadowRoots() {
     const now = Date.now();
@@ -261,7 +304,35 @@
     }
     shadowCache = roots;
     shadowCacheAt = now;
+    observeShadowRoots(roots);
     return roots;
+  }
+
+  // 增量：只遍历本次新增的节点子树，把新出现的 shadowRoot 追加进缓存（不做全量重扫）
+  function extendShadowRoots() {
+    if (!pendingAddedNodes.length) return 0;
+    const nodes = pendingAddedNodes.splice(0, pendingAddedNodes.length);
+    // 增量追加过多时强制失效，下次 scan 会全量重建并丢弃已卸载组件的 shadowRoot
+    if (shadowCache && shadowCache.length > MAX_SHADOW_ROOTS) shadowCache = null;
+    if (!shadowCache) { getShadowRoots(); return nodes.length; } // 缓存尚未建立，走全量即可
+    const fresh = [];
+    const queue = nodes.slice();
+    let guard = 0;
+    while (queue.length && guard++ < 2000) {
+      const n = queue.shift();
+      if (!n || n.nodeType !== 1) continue;
+      if (n.shadowRoot && shadowCache.indexOf(n.shadowRoot) === -1) {
+        shadowCache.push(n.shadowRoot);
+        fresh.push(n.shadowRoot);
+        queue.push(n.shadowRoot);
+      }
+      let kids;
+      try { kids = n.children || n.querySelectorAll('*'); } catch (e) { continue; }
+      for (const k of kids) queue.push(k);
+    }
+    if (fresh.length) observeShadowRoots(fresh);
+    shadowCacheAt = Date.now(); // 增量刷新后延长缓存有效期
+    return fresh.length || nodes.length;
   }
 
   // 元素 -> 昵称文本。textOf 会递归遍历子树，缓存后扫描时不再重复计算。
@@ -384,6 +455,16 @@
     return m ? m[1] : '';
   }
 
+  // 楼中楼昵称未必有 space 链接，可能只有 data-user-id / data-mid
+  function uidFromEl(el) {
+    if (!el || !el.getAttribute) return '';
+    for (const k of ['data-user-id', 'data-mid', 'data-uid', 'data-user-mid']) {
+      const v = el.getAttribute(k);
+      if (v && /^\d{2,}$/.test(String(v).trim())) return String(v).trim();
+    }
+    return uidFromHref(hrefOf(el));
+  }
+
   function hrefOf(a) {
     try { return a.getAttribute('href') || a.href || ''; } catch (e) { return ''; }
   }
@@ -440,6 +521,23 @@
     return null;
   }
 
+  // 楼中楼兜底：有些子回复的容器类名不含 comment/reply 关键词，
+  // 但只要链接确实落在评论区里，就按评论处理，避免"没有标记入口"。
+  function classifyLoose(a) {
+    const c = classify(a);
+    if (c) return c;
+    const chain = ancestors(a);
+    for (const el of chain) {
+      if (el !== a && matches(el, COMMENT_SEL)) return { scene: 'comment', host: el };
+    }
+    for (const el of chain) {
+      if (el !== a && matches(el, COMMENT_ROOT_SEL)) {
+        return { scene: 'comment', host: a.parentElement || a };
+      }
+    }
+    return null;
+  }
+
   function findLevel(a) {
     const chain = ancestors(a);
     for (let i = 0; i < Math.min(chain.length, 8); i++) {
@@ -493,11 +591,15 @@
     if (!a || !b) return false;
     const ox = Math.min(a.right, b.right) - Math.max(a.left, b.left);
     const oy = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
-    // 直接重叠，或同一行内紧挨着（头像与昵称之间常有十几到上百像素间距）
-    if (ox > -140 && oy > -60) return true;
     const cx1 = (a.left + a.right) / 2, cy1 = (a.top + a.bottom) / 2;
     const cx2 = (b.left + b.right) / 2, cy2 = (b.top + b.bottom) / 2;
-    return Math.abs(cx1 - cx2) < 240 && Math.abs(cy1 - cy2) < 60;
+    // 矩形真正重叠：一定是同一处
+    if (ox > 0 && oy > 0) return true;
+    // 同一行内紧挨着（头像链接与昵称链接）：头像高、昵称矮，垂直中心差可到 ~20px
+    const sameRow = Math.abs(cy1 - cy2) <= 26;
+    if (sameRow && ox > -160 && oy > -14) return true;
+    // 楼中楼里上下相邻的两条回复绝不能合并（哪怕同一个 UID）
+    return false;
   }
 
   // 同一位置多个候选时选最优锚点：有昵称 > 非头像链接 > 有矩形
@@ -516,7 +618,9 @@
     for (const c of cands) {
       let g = null;
       for (const gg of groups) {
-        if (c.host && gg.host === c.host) { g = gg; break; }
+        // 注意：不能只凭 host 相同就合并。楼中楼里若 host 被识别成同一个大评论容器，
+        // 会把同一用户在不同楼层的多条回复错误合并掉。
+        if (c.host && gg.host === c.host && rectNear(gg.rect, c.rect)) { g = gg; break; }
         if (rectNear(gg.rect, c.rect)) { g = gg; break; }
       }
       if (!g) { g = { host: c.host, rect: c.rect, items: [] }; groups.push(g); }
@@ -1021,8 +1125,12 @@
   const SCAN_MIN_GAP = 1500; // 连续 DOM 变动时两次全量扫描的最小间隔
 
   function scheduleScan() {
+    // 楼中楼展开等增量变动：先把新出现的 shadowRoot 补进缓存，再扫描
+    let fresh = 0;
+    try { fresh = extendShadowRoots(); } catch (e) { /* 忽略 */ }
     if (scanTimer) return;
-    const wait = Math.max(500, SCAN_MIN_GAP - (Date.now() - lastScanAt));
+    // 有真实新节点时优先快速响应（用户刚展开楼中楼），否则按节流间隔
+    const wait = fresh ? 200 : Math.max(400, SCAN_MIN_GAP - (Date.now() - lastScanAt));
     scanTimer = setTimeout(() => { scanTimer = null; scan(); }, wait);
   }
 
@@ -1047,39 +1155,42 @@
       }
     });
 
-    // 1) 收集候选
+    // 1) 收集候选（不在这里硬截断：楼中楼展开时新节点必须有机会进来看）
     const spacePage = isSpacePage();
     const ownerUid = spacePage ? spaceUid() : '';
     const cands = [];
-    let budget = MAX_TARGETS; // 锚点预算：长列表下不再无上限增长
+    const vh = window.innerHeight || 900;
     forEachRoot((root) => {
       let as;
       try { as = root.querySelectorAll(LINK_SEL); } catch (e) { return; }
       for (const a of as) {
-        if (budget <= 0) return;
-        const uid = uidFromHref(hrefOf(a));
+        // shadow 缓存里可能残留已卸载组件的 shadowRoot，其中的链接不能复活
+        if (!a.isConnected) continue;
+        const uid = uidFromEl(a);
         if (!uid) continue;
         // 空间页里，主人的视频卡片、动态全都同 UID，只在昵称处标一次，避免满屏重复
         if (ownerUid && uid === ownerUid && !isSpaceOwnerEl(a)) continue;
-        // 已在追踪中：只需更新矩形用于去重，跳过 classify / textOf 等昂贵计算
-        const known = targets.get(a);
-        if (known) {
-          const rect = rectOf(a);
-          if (!rect) continue;
-          cands.push({
-            a: a, uid: known.uid, nick: known.nick, scene: known.scene, host: known.host,
-            rect: rect, isAvatar: known.isAvatar || false, cached: true,
-          });
-          continue;
-        }
-        const c = classify(a);
-        if (!c) continue;
         const rect = rectOf(a);
         // 完全不可见（无尺寸）的链接跳过：多为隐藏的重复节点
         if (!rect) continue;
+        // 已在追踪中：只需更新矩形用于去重，跳过 classify / textOf 等昂贵计算
+        const known = targets.get(a);
+        if (known) {
+          cands.push({
+            a: a, uid: known.uid, nick: known.nick, scene: known.scene, host: known.host,
+            rect: rect, isAvatar: known.isAvatar || false, cached: true,
+            near: rect.top > -VIEW_MARGIN && rect.top < vh + VIEW_MARGIN,
+          });
+          continue;
+        }
+        const c = classifyLoose(a);
+        if (!c) continue;
         const nick = nickOf(a);
-        budget--;
-        cands.push({ a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, rect: rect, isAvatar: isAvatarLink(a) });
+        cands.push({
+          a: a, uid: uid, nick: nick, scene: c.scene, host: c.host, rect: rect,
+          isAvatar: isAvatarLink(a), cached: false,
+          near: rect.top > -VIEW_MARGIN && rect.top < vh + VIEW_MARGIN,
+        });
       }
     });
 
@@ -1111,6 +1222,18 @@
     }
     const kept = [];
     byUid.forEach((list) => { kept.push.apply(kept, dedupeAnchors(list)); });
+
+    // 3b) 数量上限：视口内 + 刚展开的新节点优先，避免长列表把楼中楼挤出去
+    if (kept.length > MAX_TARGETS) {
+      kept.sort((x, y) => {
+        const xn = x.near ? 1 : 0, yn = y.near ? 1 : 0;
+        if (xn !== yn) return yn - xn;
+        const xc = x.cached ? 1 : 0, yc = y.cached ? 1 : 0;
+        if (xc !== yc) return xc - yc; // 新节点优先
+        return (x.rect ? x.rect.top : 0) - (y.rect ? y.rect.top : 0);
+      });
+      kept.length = MAX_TARGETS;
+    }
 
     // 4) 写入 targets
     const seen = new Set();
@@ -1772,9 +1895,12 @@
     scan();
 
     // 页面结构变化 -> 防抖重扫（只读取，不写入页面 DOM）
+    // 复用 onRootMutation：新增节点会被增量扩展进 shadow 缓存，楼中楼展开能立刻被看到
     try {
-      new MutationObserver(() => scheduleScan()).observe(document.body, { childList: true, subtree: true });
+      new MutationObserver(onRootMutation).observe(document.body, { childList: true, subtree: true });
     } catch (e) { /* 忽略 */ }
+    // 给已存在的 shadowRoot 也挂观察器（MutationObserver 不跨 shadow boundary）
+    try { observeShadowRoots(getShadowRoots()); } catch (e) { /* 忽略 */ }
 
     // 位置跟随滚动 / 缩放：passive 避免阻塞滚动，rAF 节流避免每帧多次计算
     const passiveOpt = { passive: true, capture: true };
@@ -1876,5 +2002,8 @@
     layout: layout,
     scan: scan,
     shadowRoots: getShadowRoots,
+    uidFromEl: uidFromEl,
+    classifyLoose: classifyLoose,
+    rectNear: rectNear,
   };
 })();
