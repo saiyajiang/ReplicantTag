@@ -2,7 +2,7 @@
 // @name         ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @name:zh-CN   ReplicantTag · 用户标记器（昵称/UID · 视频/评论留痕）
 // @namespace    https://github.com/saiyajiang/ReplicantTag
-// @version      1.5.1
+// @version      1.5.2
 // @description  给视频或评论对应的用户打标记：自动记录昵称与UID；标记视频时同时记录标题、BV号与视频时间，标记评论时记录评论内容。标记可下拉复用，一个用户可有多个标记；标记直接显示在评论区行右侧、视频卡片UP名右侧、播放页昵称右侧，支持隐身模式一键隐藏全部痕迹，支持导出/导入备份。采用浮层渲染，不向页面插入任何节点。支持B站视频页、用户空间页、视频卡片与评论区，后续将扩展至更多站点。本脚本由 AI 编写。
 // @description:en  Tag users behind videos or comments: auto-record nickname & UID; for videos it also keeps the title, BV id and publish date, for comments it keeps the comment text. Tags are reusable from a dropdown and a user can carry several at once. Rendered in a standalone overlay layer (no DOM injected into the page): beside the comment level badge, under video card titles, and at the left edge of the UP panel. Stealth mode hides everything, JSON export/import included. Bilibili only for now. This script is written by AI.
 // @author       saiyajiang
@@ -95,6 +95,12 @@
   const PUBDATE_SEL = ['[class*="pubdate"]', '[class*="pub-date"]', '.video-data .date', '.bili-video-info__date'];
   // 用户空间页（space.bilibili.com）的昵称元素
   const SPACE_NICK_SEL = ['#h-name', '.nickname', '.h-name', '.name', '[class*="nickname"]', 'h1'];
+  // 播放器容器：全屏 / 网页全屏时它会铺满视口，标记必须避开这块区域
+  const PLAYER_SEL = [
+    '.bpx-player-container', '#bilibili-player', '#bofqi', '#playerWrap',
+    '.player-container', '.bpx-player-primary-area', 'bpx-player',
+    '[class*="player-wrap"]', '[class*="player-container"]', 'video',
+  ];
 
   /* ====================== 存储 ====================== */
 
@@ -852,13 +858,60 @@
     return avoidRectsOf({ host: host, a: a });
   }
 
-  // 矩形是否相交（标记框 vs 按钮）
+  // 矩形是否相交（标记框 vs 按钮 / 播放器）
   function collides(left, top, bw, bh, avoids) {
     if (!avoids || !avoids.length) return false;
     for (const a of avoids) {
       if (left < a.right && left + bw > a.left && top < a.bottom && top + bh > a.top) return true;
     }
     return false;
+  }
+
+  /* ---------------- 全屏 / 网页全屏 ---------------- */
+
+  // 真全屏（Fullscreen API）。此时整个浮层直接隐藏。
+  function isFullscreenAPI() {
+    try {
+      return !!(document.fullscreenElement || document.webkitFullscreenElement ||
+        document.mozFullScreenElement || document.msFullscreenElement);
+    } catch (e) { return false; }
+  }
+
+  // 播放器元素缓存：只找一次，之后每帧只重新读矩形（网页全屏切换时矩形会变）
+  let playerEls = null;
+  let playerElsAt = 0;
+
+  function getPlayerEls() {
+    const now = Date.now();
+    if (playerEls && now - playerElsAt < SHADOW_CACHE_TTL) return playerEls;
+    const out = [];
+    forEachRoot((root) => {
+      let els;
+      try { els = root.querySelectorAll(PLAYER_SEL.join(',')); } catch (e) { return; }
+      for (const el of els) {
+        if (out.length >= 6) break;
+        if (out.indexOf(el) === -1) out.push(el);
+      }
+    });
+    playerEls = out;
+    playerElsAt = now;
+    return out;
+  }
+
+  function invalidatePlayerEls() { playerEls = null; }
+
+  // 返回当前视口坐标系下、足够大的播放器矩形（网页全屏时它就是整个视口）
+  function playerRects(vw, vh) {
+    const out = [];
+    for (const el of getPlayerEls()) {
+      const r = rectOf(el);
+      if (!r) continue;
+      // 过小的浮窗/画中画不算，避免误伤普通页面上的标记
+      if (r.width < vw * 0.3 || r.height < vh * 0.3) continue;
+      if (r.right < 0 || r.left > vw || r.bottom < 0 || r.top > vh) continue;
+      out.push(r);
+    }
+    return out;
   }
 
   // 定位参考元素
@@ -1044,12 +1097,15 @@
   function layout() {
     if (!overlay || !overlay.isConnected) ensureOverlay();
     if (!overlay) return;
-    const paused = !store.settings.enabled || store.settings.stealth;
+    // 真全屏时整个浮层收起：浏览器只允许全屏元素的子树显示，浮层不该盖在视频上
+    const paused = !store.settings.enabled || store.settings.stealth || isFullscreenAPI();
     if (paused) { overlay.style.display = 'none'; return; }
     overlay.style.display = '';
 
     const vw = window.innerWidth;
     const vh = window.innerHeight;
+    // 网页全屏（B站用 CSS 铺满播放器，不走 Fullscreen API）：逐标记避开播放器区域
+    const playerAreas = playerRects(vw, vh);
 
     /* ---- 阶段 1：只读。集中读取几何信息，避免与写入交替触发强制同步布局 ---- */
     const jobs = [];
@@ -1103,7 +1159,13 @@
       const rec = j.rec, box = j.box;
       if (j.hide) { box.style.display = 'none'; continue; }
       box.style.display = '';
-      const pos = computePos(j.rects.mode, j.rects, rec.bw || 40, rec.bh || 18, vw);
+      const bw = rec.bw || 40, bh = rec.bh || 18;
+      const pos = computePos(j.rects.mode, j.rects, bw, bh, vw);
+      // 全屏 / 网页全屏：落在大播放器矩形内的标记一律隐藏，不盖到视频画面上
+      if (collides(pos.left, pos.top, bw, bh, playerAreas)) {
+        box.style.display = 'none';
+        continue;
+      }
       if (pos.maxW) box.style.maxWidth = pos.maxW + 'px';
       else box.style.maxWidth = '';
       box.style.transform = 'translate(' + pos.left + 'px,' + pos.top + 'px)';
@@ -1741,7 +1803,7 @@
 
   function applyStealth() {
     if (overlay) {
-      overlay.style.display = (!store.settings.enabled || store.settings.stealth) ? 'none' : '';
+      overlay.style.display = (!store.settings.enabled || store.settings.stealth || isFullscreenAPI()) ? 'none' : '';
       overlay.classList.toggle('rt-dim', !!store.settings.dim);
     }
   }
@@ -1905,8 +1967,22 @@
     // 位置跟随滚动 / 缩放：passive 避免阻塞滚动，rAF 节流避免每帧多次计算
     const passiveOpt = { passive: true, capture: true };
     window.addEventListener('scroll', requestLayout, passiveOpt);
-    window.addEventListener('resize', requestLayout, { passive: true });
+    window.addEventListener('resize', () => { invalidatePlayerEls(); requestLayout(); }, { passive: true });
     document.addEventListener('scroll', requestLayout, passiveOpt);
+
+    // 进入 / 退出真全屏，以及 B站网页全屏（给 html 加 class）时立即重算，
+    // 避免标记滞留或无法及时恢复
+    const onFsChange = () => { invalidatePlayerEls(); requestLayout(); };
+    ['fullscreenchange', 'webkitfullscreenchange', 'mozfullscreenchange', 'MSFullscreenChange']
+      .forEach((ev) => { try { document.addEventListener(ev, onFsChange); } catch (e) { /* 忽略 */ } });
+    try {
+      new MutationObserver(onFsChange).observe(document.documentElement, {
+        attributes: true, attributeFilter: ['class', 'style'],
+      });
+      new MutationObserver(onFsChange).observe(document.body, {
+        attributes: true, attributeFilter: ['class', 'style'],
+      });
+    } catch (e) { /* 忽略 */ }
 
     // 定时兜底：应对纯 CSS 布局变化与懒加载（频率已下调，主要靠 MutationObserver）
     setInterval(() => { scan(); }, SCAN_INTERVAL);
@@ -2005,5 +2081,8 @@
     uidFromEl: uidFromEl,
     classifyLoose: classifyLoose,
     rectNear: rectNear,
+    isFullscreenAPI: isFullscreenAPI,
+    playerRects: playerRects,
+    invalidatePlayerEls: invalidatePlayerEls,
   };
 })();
