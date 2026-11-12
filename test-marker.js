@@ -605,6 +605,92 @@ function assert(cond, msg) { console.log((cond ? 'PASS ' : 'FAIL ') + msg); if (
   assert(rt.targets.size === 1, '收起楼中楼后锚点被清理，只剩主评论，实际 ' + rt.targets.size);
 }
 
+/* ==================================================================== */
+/*  场景 F：全屏 / 网页全屏 —— 标记不得盖在视频画面上                      */
+/* ==================================================================== */
+{
+  const html = `<!doctype html><html><head><title>全屏测试 - 哔哩哔哩</title></head><body>
+  <div class="bpx-player-container" id="player"></div>
+  <div id="comment"><bili-comment id="f1"></bili-comment><bili-comment id="f2"></bili-comment><bili-comment id="f3"></bili-comment></div>
+  </body></html>`;
+  const dom = new JSDOM(html, { url: 'https://www.bilibili.com/video/BV1GJ411x7h7', pretendToBeVisual: true, runScripts: 'outside-only' });
+  const { window } = dom; const doc = window.document;
+  const { mem, menus } = stubGM(window);
+  window.innerWidth = 1440; window.innerHeight = 900;
+
+  // 播放器矩形可动态切换：普通播放页只占上半部分；网页全屏时铺满视口
+  let playerRect = { x: 0, y: 0, left: 0, top: 0, right: 1000, bottom: 600, width: 1000, height: 600 };
+  const player = doc.getElementById('player');
+  player.getBoundingClientRect = () => Object.assign({ toJSON() { return this; } }, playerRect);
+
+  const ys = [700, 750, 800];
+  ys.forEach((y, i) => {
+    const el = doc.getElementById('f' + (i + 1));
+    const sr = el.attachShadow({ mode: 'open' });
+    sr.innerHTML = `<div class="comment-wrap">
+      <div class="user-info"><a href="//space.bilibili.com/${900 + i}" class="user-name">观众${i}</a><span class="level">Lv3</span></div>
+      <bili-rich-text><span>评论${i}</span></bili-rich-text>
+    </div>`;
+    rect(sr.querySelector('.user-name'), 200, y, 90, 16);
+    rect(sr.querySelector('.level'), 295, y, 30, 16);
+    rect(el, 90, y - 10, 900, 60);
+  });
+
+  await new Promise((r) => setTimeout(r, 80));
+  window.eval(src);
+  await new Promise((r) => setTimeout(r, 80));
+
+  const rt = window.__rt;
+  const overlay = doc.getElementById('rt-overlay');
+  const boxes = () => Array.from(overlay.querySelectorAll('.rt-box'));
+  const visibleCount = () => boxes().filter((b) => b.style.display !== 'none').length;
+
+  console.log('--- 场景 F：全屏 / 网页全屏 ---');
+  assert(rt.targets.size === 3, '识别出 3 个评论锚点，实际 ' + rt.targets.size);
+  assert(visibleCount() === 3, '普通播放页：播放器下方的评论标记正常显示，实际 ' + visibleCount());
+  assert(rt.isFullscreenAPI() === false, '未进入真全屏');
+  assert(rt.playerRects(1440, 900).length === 1, '检测到播放器区域（普通模式）');
+
+  // === 网页全屏：B站用 CSS 把播放器铺满视口，并给 html 加 class ===
+  playerRect = { x: 0, y: 0, left: 0, top: 0, right: 1440, bottom: 900, width: 1440, height: 900 };
+  doc.documentElement.classList.add('player-mode-widescreen');
+  rt.invalidatePlayerEls();
+  rt.layout();
+  assert(visibleCount() === 0, '网页全屏：所有落在视频上的标记被隐藏，实际可见 ' + visibleCount());
+  assert(overlay.style.display !== 'none', '网页全屏时浮层本身仍在（只是逐个标记隐藏）');
+
+  // === 退出网页全屏：标记自动恢复 ===
+  playerRect = { x: 0, y: 0, left: 0, top: 0, right: 1000, bottom: 600, width: 1000, height: 600 };
+  doc.documentElement.classList.remove('player-mode-widescreen');
+  rt.invalidatePlayerEls();
+  rt.layout();
+  assert(visibleCount() === 3, '退出网页全屏后标记全部恢复，实际 ' + visibleCount());
+
+  // === 真全屏（Fullscreen API）：整个浮层收起 ===
+  let fsEl = doc.getElementById('player');
+  Object.defineProperty(doc, 'fullscreenElement', { configurable: true, get: () => fsEl });
+  assert(rt.isFullscreenAPI() === true, '检测到 Fullscreen API 全屏');
+  rt.layout();
+  assert(overlay.style.display === 'none', '真全屏时整个浮层隐藏');
+  assert(boxes().length === 3, '真全屏时标记框仍在 DOM 中，靠父级 display:none 整体隐藏');
+
+  // 退出真全屏：fullscreenchange 事件应触发重排并恢复
+  fsEl = null;
+  doc.dispatchEvent(new window.Event('fullscreenchange'));
+  await new Promise((r) => setTimeout(r, 60));
+  assert(rt.isFullscreenAPI() === false, '退出全屏后状态复位');
+  assert(overlay.style.display !== 'none', 'fullscreenchange 后浮层恢复');
+  assert(visibleCount() === 3, '退出真全屏后标记全部恢复，实际 ' + visibleCount());
+
+  // 隐藏优先级：隐身模式与全屏互不冲突
+  const toggle = menus.find((m) => /Alt\+Shift\+M/.test(m[0]) && !/removed/.test(m[0]));
+  assert(!!toggle, '显示/隐藏菜单仍可用');
+  toggle[1]();
+  assert(overlay.style.display === 'none', '隐身模式依然隐藏全部');
+  toggle[1]();
+  assert(overlay.style.display !== 'none', '再次切换恢复');
+}
+
 console.log(fails ? ('\nFAILED: ' + fails) : '\nALL PASS');
 process.exit(fails ? 1 : 0);
 })();
